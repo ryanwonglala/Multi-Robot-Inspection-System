@@ -1,5 +1,4 @@
-# ROS2-indoor-inspection-robot
-
+# Task-Driven Collaborative Multi-Robot Inspection System for Indoor Environments
 
 ## Project Overview
 
