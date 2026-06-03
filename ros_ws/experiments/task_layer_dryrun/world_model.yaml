@@ -1,0 +1,338 @@
+world:
+  name: inspection_facility_map
+  source_sdf: src/sim/worlds/map.sdf
+  frame: map
+  units: meters
+  description: Semantic area model derived from the floor markers in map.sdf. Coordinates
+    use the Gazebo/SDF world frame and should be reused after remapping from the same
+    spawn frame.
+robot_start:
+  area: charging_station
+  pose:
+    x: -4.8
+    y: -3.825
+    z: 0.0
+    yaw: -1.5708
+  note: Demo robot starts inside the charging marker, facing wall_mother_base_south.
+    These coordinates are in the Gazebo/SDF world frame.
+areas:
+  entrance_lobby:
+    display_name: Entrance Lobby
+    type: lobby
+    marker_model: entrance_marker
+    center:
+    - 0.0
+    - -5.7
+    size:
+    - 3.8
+    - 2.3
+    bounds:
+      x_min: -1.9
+      x_max: 1.9
+      y_min: -6.85
+      y_max: -4.55
+    color_rgba:
+    - 0.5
+    - 0.779999971
+    - 1.0
+    - 0.660000026
+  main_corridor:
+    display_name: Main Corridor
+    type: corridor
+    marker_model: corridor_marker
+    center:
+    - 0.0
+    - -2.6
+    size:
+    - 1.9
+    - 3.9
+    bounds:
+      x_min: -0.95
+      x_max: 0.95
+      y_min: -4.55
+      y_max: -0.65
+    color_rgba:
+    - 0.479999989
+    - 0.819999993
+    - 0.560000002
+    - 0.560000002
+  central_hall:
+    display_name: Central Hall
+    type: hall
+    marker_model: central_hall_marker
+    center:
+    - 0.0
+    - 1.2
+    size:
+    - 3.7
+    - 3.7
+    bounds:
+      x_min: -1.85
+      x_max: 1.85
+      y_min: -0.65
+      y_max: 3.05
+    color_rgba:
+    - 0.400000006
+    - 0.779999971
+    - 0.479999989
+    - 0.680000007
+  mother_base:
+    display_name: Mother Base Bay
+    type: operations_bay
+    marker_model: mother_base_marker
+    center:
+    - -3.575
+    - -3.3
+    size:
+    - 4.55
+    - 1.5
+    bounds:
+      x_min: -5.85
+      x_max: -1.3
+      y_min: -4.05
+      y_max: -2.55
+    color_rgba:
+    - 0.140000001
+    - 0.319999993
+    - 0.920000017
+    - 0.699999988
+  charging_station:
+    display_name: Charging Station
+    type: docking_reference
+    marker_model: charging_marker
+    center:
+    - -4.8
+    - -3.825
+    size:
+    - 1.1
+    - 0.45
+    bounds:
+      x_min: -5.35
+      x_max: -4.25
+      y_min: -4.05
+      y_max: -3.6
+    color_rgba:
+    - 0.0199999996
+    - 0.0799999982
+    - 0.419999987
+    - 0.779999971
+  lab_room:
+    display_name: Lab Room
+    type: room
+    marker_model: lab_marker
+    center:
+    - -4.25
+    - 4.25
+    size:
+    - 3.8
+    - 4.2
+    bounds:
+      x_min: -6.15
+      x_max: -2.35
+      y_min: 2.15
+      y_max: 6.35
+    color_rgba:
+    - 0.879999995
+    - 0.460000008
+    - 0.419999987
+    - 0.579999983
+  prep_room:
+    display_name: Prep Room
+    type: room
+    marker_model: prep_room_marker
+    center:
+    - -8.15
+    - 5.1
+    size:
+    - 3.4
+    - 2.5
+    bounds:
+      x_min: -9.85
+      x_max: -6.45
+      y_min: 3.85
+      y_max: 6.35
+    color_rgba:
+    - 0.92
+    - 0.18
+    - 0.72
+    - 0.62
+  north_hall:
+    display_name: North Hall
+    type: hall
+    marker_model: north_hall_marker
+    center:
+    - 0.2
+    - 4.775
+    size:
+    - 4.5
+    - 3.15
+    bounds:
+      x_min: -2.05
+      x_max: 2.45
+      y_min: 3.2
+      y_max: 6.35
+    color_rgba:
+    - 0.24
+    - 0.92
+    - 0.95
+    - 0.6
+  east_hall:
+    display_name: East Hall
+    type: hall
+    marker_model: east_hall_marker
+    center:
+    - 5.76041
+    - 0.85
+    size:
+    - 7.22082
+    - 4.0
+    bounds:
+      x_min: 2.15
+      x_max: 9.370819664
+      y_min: -1.15
+      y_max: 2.85
+    color_rgba:
+    - 0.78
+    - 0.92
+    - 0.22
+    - 0.6
+  server_room:
+    display_name: Server Room
+    type: room
+    marker_model: server_marker
+    center:
+    - 4.5
+    - 4.85
+    size:
+    - 3.2
+    - 2.9
+    bounds:
+      x_min: 2.9
+      x_max: 6.1
+      y_min: 3.4
+      y_max: 6.3
+    color_rgba:
+    - 0.959999979
+    - 0.819999993
+    - 0.300000012
+    - 0.620000005
+  server_door:
+    display_name: Server Door
+    type: doorway
+    marker_model: server_door_marker
+    center:
+    - 4.2
+    - 3.0
+    size:
+    - 1.3
+    - 0.45
+    bounds:
+      x_min: 3.55
+      x_max: 4.85
+      y_min: 2.775
+      y_max: 3.225
+    color_rgba:
+    - 1.0
+    - 0.879999995
+    - 0.180000007
+    - 0.75
+  restricted_gate:
+    display_name: Restricted Gate
+    type: doorway
+    marker_model: restricted_gate_marker
+    center:
+    - 7.5
+    - 3.0
+    size:
+    - 1.4
+    - 0.45
+    bounds:
+      x_min: 6.8
+      x_max: 8.2
+      y_min: 2.775
+      y_max: 3.225
+    color_rgba:
+    - 0.949999988
+    - 0.340000004
+    - 0.119999997
+    - 0.699999988
+  restricted_zone:
+    display_name: Restricted Zone
+    type: controlled_area
+    marker_model: restricted_marker
+    center:
+    - 7.96041
+    - 4.75
+    size:
+    - 2.82082
+    - 3.2
+    bounds:
+      x_min: 6.55
+      x_max: 9.370819664
+      y_min: 3.15
+      y_max: 6.35
+    color_rgba:
+    - 0.839999974
+    - 0.180000007
+    - 0.119999997
+    - 0.620000005
+  storage_area:
+    display_name: Storage Area
+    type: room
+    marker_model: storage_marker
+    center:
+    - 3.65
+    - -2.75
+    size:
+    - 4.8
+    - 2.6
+    bounds:
+      x_min: 1.25
+      x_max: 6.05
+      y_min: -4.05
+      y_max: -1.45
+    color_rgba:
+    - 0.579999983
+    - 0.360000014
+    - 0.819999993
+    - 0.639999986
+  utility_area:
+    display_name: Utility Area
+    type: room
+    marker_model: utility_marker
+    center:
+    - 7.7
+    - -2.9
+    size:
+    - 2.7
+    - 2.9
+    bounds:
+      x_min: 6.35
+      x_max: 9.05
+      y_min: -4.35
+      y_max: -1.449999952
+    color_rgba:
+    - 0.180000007
+    - 0.779999971
+    - 0.800000012
+    - 0.639999986
+  narrow_passage:
+    display_name: Narrow Passage
+    type: passage
+    marker_model: narrow_passage_marker
+    center:
+    - 5.908259
+    - -5.2
+    size:
+    - 6.283483
+    - 1.0
+    bounds:
+      x_min: 2.766517305
+      x_max: 9.05
+      y_min: -5.7
+      y_max: -4.7
+    color_rgba:
+    - 0.980000019
+    - 0.579999983
+    - 0.200000003
+    - 0.680000007

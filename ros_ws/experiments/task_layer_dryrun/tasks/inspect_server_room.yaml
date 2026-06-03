@@ -1,0 +1,5 @@
+task:
+  type: inspect_area
+  target: server_room
+  require_image: true
+  priority: high
