@@ -1,139 +1,198 @@
-# TB4 RoboInspect
+# ROS Workspace
 
-ROS 2 Jazzy workspace for task-driven TurtleBot4 inspection simulation.
+ROS 2 Jazzy workspace for RoboInspect simulation and task-layer development.
 
-This workspace is the clean project line for RoboInspect. It is isolated from `~/grad_project_ws` and no longer uses the old custom robot stack as the main mapping/control platform.
+This workspace contains the current ROS/Gazebo/Nav2 prototype for the multi-robot inspection project. At this stage, the implemented system focuses on a single TurtleBot4 in simulation, semantic-area navigation, route-based inspection, evidence capture, report generation, and a unified task GUI.
 
-## Direction
+The repository root README describes the overall project. This README focuses only on the ROS workspace under `ros_ws/`.
 
-The project goal is to build a task-driven multi-robot inspection framework:
+## Current Status
 
-> Predefined robot skills are dynamically composed, assigned, and adjusted based on task goals, robot capabilities, and execution feedback.
-
-In short:
-
-- robot skills are predefined
-- full inspection routines are not hard-coded routes
-- tasks are decomposed into skill sequences or task graphs
-- robots are selected by capability and status
-- execution feedback can trigger fallback or reassignment
-
-The detailed development guide is [doc/DESCRIPTION.md](doc/DESCRIPTION.md).
-
-## Current Base
-
-The current base is a working TurtleBot4 simulation stack:
-
-- official TurtleBot4 Gazebo simulation installed under `/opt/ros/jazzy`
-- custom inspection facility world in `src/sim/worlds/map.sdf`
-- local launch glue in `src/sim/launch/map.launch.py`
-- minimal control GUI in `src/sim/scripts/ctl.py`
-- baseline SLAM map saved in `maps/base_20260527.yaml` and `maps/base_20260527.pgm`
-
-Local code should wrap or configure the mature TurtleBot4 stack instead of replacing stable upstream behavior.
-
-## Architecture Target
-
-The next software layer should be organized around five levels:
+Current working baseline:
 
 ```text
-Task Input Layer
-Task Planner Layer
-Skill Layer
-Robot Assignment Layer
-ROS2 Execution Layer
+single TurtleBot4 + Gazebo map + Nav2 + semantic areas + inspection route + report + task GUI
 ```
 
-Initial task input should be structured, not natural language. Example:
+Latest prototype package:
 
-```yaml
-task:
-  type: inspect_area
-  target: room_A
-  require_image: true
-  priority: normal
+```text
+experiments/task_layer_v020/
 ```
 
-## Near-Term Priorities
-
-1. Single TurtleBot4 accepts a structured task command and executes a basic inspection sequence.
-2. Two TurtleBot4 robots run with namespaces, independent navigation, and simple task assignment.
-3. Capability models describe what each robot can do.
-4. Feedback and fallback handle unavailable robots or failed navigation.
-5. Mother-child/scout robot behavior remains an exploration branch, validated first as task logic in simulation.
-
-Avoid spending the next phase on LLM interfaces, complex object detection, reinforcement learning, real manipulator control, full docking, or multi-robot SLAM unless they directly serve the task-driven inspection demo.
-
-## Demo Targets
-
-The minimal demo path should aim for:
-
-- single-robot task decomposition
-- two-robot parallel inspection
-- reassignment when a robot is unavailable
-- optional scout/narrow-area task flow
+The v0.2 prototype is considered sufficient as the current single-robot simulation baseline.
 
 ## Workspace Layout
 
-Short names are intentional.
-
 ```text
-src/sim        simulation package, launch files, worlds, GUI script
-maps           saved SLAM maps
-doc            dated project records and direction docs
+src/sim/                         Gazebo map world and simulation launch package
+maps/                            saved occupancy maps for localization/Nav2
+doc/                             dated project logs, debug notes, plans, and commands
+experiments/task_layer_v010/      v0.1 fixed-coordinate semantic navigation archive
+experiments/task_layer_v020/      v0.2 route inspection, reports, scene spawning, task GUI
+experiments/task_layer_dryrun/    early dry-run task-layer prototype
 ```
 
-Documentation layout:
+Generated build/runtime directories are not part of the source tree:
 
 ```text
-doc/YYYYMMDD/log
-doc/YYYYMMDD/cmd
-doc/YYYYMMDD/dbg
-doc/YYYYMMDD/plan
+build/
+install/
+log/
 ```
 
-## Common Commands
+## Main v0.2 Features
 
-Build:
+`experiments/task_layer_v020` includes:
+
+- one-command bringup for Gazebo, localization, Nav2, RViz, and automatic initial pose
+- semantic world model in `config/world_model.yaml`
+- aligned occupancy map support using `maps/base_aligned_20260602.yaml`
+- Nav2-based semantic area navigation
+- custom inspection routes by semantic area name
+- adaptive inspection candidate poses based on area bounds
+- four-direction camera evidence capture after reaching an inspection pose
+- Nav failure evidence capture
+- return-home behavior to a safe charging-station standoff pose
+- concise `report.yaml` plus detailed `details.yaml`
+- Gazebo model spawning for test obstacles and scene setup
+- unified `task_gui` with `Navigate`, `Inspect`, and `Scene` tabs
+
+Not included in v0.2:
+
+- multi-robot assignment
+- YOLO or visual object recognition
+- true anomaly classification
+- precision docking
+- real hardware integration
+- robotic arm control
+
+## Build
+
+From the repository root:
 
 ```bash
-cd /home/ryan/tb4_ws
+cd ros_ws
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select task_layer_v020
+source install/setup.bash
+```
+
+For a full workspace build:
+
+```bash
+cd ros_ws
 source /opt/ros/jazzy/setup.bash
 colcon build
 source install/setup.bash
 ```
 
-Launch simulation and SLAM:
+## Launch v0.2 Simulation
+
+Start Gazebo, TurtleBot4, localization, Nav2, RViz, and automatic initial pose:
 
 ```bash
-ros2 launch sim map.launch.py
-```
-
-Launch control GUI:
-
-```bash
-ros2 launch sim ctl.launch.py
-```
-
-Save map:
-
-```bash
-ros2 run nav2_map_server map_saver_cli -f maps/base_YYYYMMDD
-```
-
-After editing `src/sim/worlds/map.sdf` in Gazebo GUI, rebuild before using `ros2 launch`:
-
-```bash
-colcon build
+cd ros_ws
 source install/setup.bash
+ros2 launch task_layer_v020 bringup_nav.launch.py
 ```
 
-## Direction Check
+Open the unified task GUI in another terminal:
+
+```bash
+cd ros_ws
+source install/setup.bash
+ros2 launch task_layer_v020 task_gui.launch.py
+```
+
+The GUI has three tabs:
+
+```text
+Navigate    send Nav2 goals to semantic areas
+Inspect     build and execute inspection routes
+Scene       spawn test models/obstacles into Gazebo
+```
+
+## CLI Examples
+
+Navigate to a semantic area:
+
+```bash
+ros2 run task_layer_v020 go_to_area --ros-args \
+  -p use_sim_time:=true \
+  -p target:=north_hall
+```
+
+Run an inspection route:
+
+```bash
+ros2 run task_layer_v020 inspect_area --ros-args \
+  -p use_sim_time:=true \
+  -p route:=prep_room,lab_room,north_hall \
+  -p max_candidate_attempts_per_area:=2 \
+  -p candidate_spread_ratio:=0.35 \
+  -p return_home:=true
+```
+
+Dry-run inspection without moving the robot:
+
+```bash
+ros2 run task_layer_v020 inspect_area --ros-args \
+  -p target:=north_hall \
+  -p dry_run:=true
+```
+
+Spawn a test obstacle by semantic area:
+
+```bash
+ros2 run task_layer_v020 spawn_model --ros-args \
+  -p model:=small_box_obstacle \
+  -p area:=north_hall \
+  -p placement:=random \
+  -p random_margin:=0.2
+```
+
+## Reports
+
+Inspection reports are generated under:
+
+```text
+experiments/task_layer_v020/reports/
+```
+
+Each inspection run creates a folder containing:
+
+```text
+report.yaml       concise human-facing status/evidence report
+details.yaml      full technical details for debugging
+NN_area_name/     captured camera evidence images
+```
+
+Generated report contents are ignored by git. Only `reports/.gitignore` is tracked.
+
+## Important Notes
+
+- The map and Gazebo world are currently aligned around the v0.2 start pose and saved map workflow.
+- `task_layer_v020` uses `config/nav2_inspection.yaml`, which keeps TurtleBot4 Nav2 behavior while tightening final yaw tolerance for inspection photos.
+- Return-home is a Nav2 goal to a safe standoff point near the charger, not precision docking.
+- LiDAR-based anomaly detection was tested and removed from v0.2 because results were unstable. Reports currently record execution status and evidence only.
+
+## Development Direction
+
+The next major step should be a cleaner v0.3 task layer rather than adding more ad-hoc logic to v0.2.
+
+Suggested v0.3 direction:
+
+- explicit skill interfaces such as `NavigateToArea`, `InspectAreaRoute`, `CaptureEvidence`, and `ReturnHome`
+- structured task input files
+- task execution state machine
+- GUI support for route presets and report browsing
+- later multi-robot namespace/assignment support
+- later visual recognition module if needed
 
 Before adding a feature, ask:
 
 - Does it support task-driven inspection?
-- Does it prove the system is not a fixed route script?
-- Does it improve robot coordination?
+- Does it avoid turning the system into a fixed route script?
 - Can it be validated quickly in Gazebo?
 - Can it become part of the final demo?
