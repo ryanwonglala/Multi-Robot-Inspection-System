@@ -1,0 +1,8 @@
+robots:
+  tb4_1:
+    status: available
+    namespace: ""
+    capabilities:
+      - navigate
+      - inspect_area
+      - capture_image

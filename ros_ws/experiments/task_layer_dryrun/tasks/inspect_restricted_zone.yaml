@@ -1,0 +1,5 @@
+task:
+  type: inspect_area
+  target: restricted_zone
+  require_image: true
+  priority: high

@@ -1,0 +1,5 @@
+task:
+  type: inspect_area
+  target: lab_room
+  require_image: true
+  priority: normal
