@@ -1,5 +1,9 @@
 build/
 install/
-log/
-*.pyc
+/log/
+reports/
 __pycache__/
+*.pyc
+*.pyo
+.colcon_install_layout
+COLCON_IGNORE

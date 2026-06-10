@@ -1,203 +1,166 @@
 #!/usr/bin/env python3
+"""Manual Tkinter drive GUI for TurtleBot3 Burger + Gazebo Classic."""
 import math
 import threading
 import tkinter as tk
-from tkinter import ttk
 
 import rclpy
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 
-
+LIN_MAX = 0.22   # TB3 Burger max linear  (m/s)
+ANG_MAX = 2.84   # TB3 Burger max angular (rad/s)
 HZ = 10
-LIN_MAX = 0.7
-ANG_MAX = 1.8
-LIN_DEFAULT = 0.2
-ANG_DEFAULT = 0.6
-
-
-def yaw_from_quat(q):
-    siny = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny, cosy)
+STEP_LIN = 0.02
+STEP_ANG = 0.1
 
 
 class CtlNode(Node):
     def __init__(self):
-        super().__init__('tb4_ctl')
-        self.declare_parameter('cmd', '/cmd_vel')
-        self.declare_parameter('odom', '/odom')
-        cmd = self.get_parameter('cmd').value
-        odom = self.get_parameter('odom').value
-        self.pub = self.create_publisher(TwistStamped, cmd, 10)
-        self.sub = self.create_subscription(Odometry, odom, self._odom_cb, 10)
-        self.odom = None
-        self.cmd_topic = cmd
-        self.odom_topic = odom
+        super().__init__('manual_controller')
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('odom_topic', '/odom')
+
+        cmd_topic = self.get_parameter('cmd_vel_topic').get_parameter_value().string_value
+        odom_topic = self.get_parameter('odom_topic').get_parameter_value().string_value
+
+        self.pub = self.create_publisher(Twist, cmd_topic, 10)
+        self.create_subscription(Odometry, odom_topic, self._odom_cb, 10)
+
+        self.lin = 0.0
+        self.ang = 0.0
+        self.x = 0.0
+        self.y = 0.0
+        self.yaw = 0.0
+
+        self.create_timer(1.0 / HZ, self._publish)
 
     def _odom_cb(self, msg):
-        self.odom = msg
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.yaw = math.atan2(siny, cosy)
 
-    def send(self, lin, ang):
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = ''
-        msg.twist.linear.x = float(lin)
-        msg.twist.angular.z = float(ang)
+    def _publish(self):
+        msg = Twist()
+        msg.linear.x = self.lin
+        msg.angular.z = self.ang
         self.pub.publish(msg)
 
-    def stop(self):
-        self.send(0.0, 0.0)
 
-
-class CtlGui:
-    def __init__(self, node):
+class CtlGUI:
+    def __init__(self, node: CtlNode):
         self.node = node
-        self.lin_dir = 0.0
-        self.ang_dir = 0.0
-        self.active_keys = set()
-        self.running = True
-
         self.root = tk.Tk()
-        self.root.title('TB4 ctl')
-        self.root.minsize(360, 300)
-        self.root.protocol('WM_DELETE_WINDOW', self.close)
+        self.root.title('TB3 Burger Manual Controller')
+        self.root.resizable(False, False)
 
-        self.lin = tk.DoubleVar(value=LIN_DEFAULT)
-        self.ang = tk.DoubleVar(value=ANG_DEFAULT)
-        self.state = tk.StringVar(value='idle')
-        self.odom = tk.StringVar(value='odom: --')
-        self.topics = tk.StringVar(value=f'cmd: {node.cmd_topic}   odom: {node.odom_topic}')
+        pad = {'padx': 6, 'pady': 4}
 
-        self._build()
-        self.root.bind('<KeyPress>', self.key_press)
-        self.root.bind('<KeyRelease>', self.key_release)
-        self.root.after(int(1000 / HZ), self.tick)
-        self.root.after(100, self.update_odom)
+        # ── Speed display ──────────────────────────────────────────
+        speed_frame = tk.LabelFrame(self.root, text='Speed', **pad)
+        speed_frame.grid(row=0, column=0, columnspan=3, sticky='ew', **pad)
 
-    def _build(self):
-        pad = {'padx': 8, 'pady': 6}
-        main = ttk.Frame(self.root, padding=10)
-        main.pack(fill='both', expand=True)
+        tk.Label(speed_frame, text='Linear (m/s):').grid(row=0, column=0, sticky='w')
+        self.lin_var = tk.StringVar(value='0.00')
+        tk.Label(speed_frame, textvariable=self.lin_var, width=6,
+                 relief='sunken').grid(row=0, column=1)
 
-        grid = ttk.LabelFrame(main, text='Motion')
-        grid.pack(fill='x', **pad)
+        tk.Label(speed_frame, text='Angular (rad/s):').grid(row=1, column=0, sticky='w')
+        self.ang_var = tk.StringVar(value='0.00')
+        tk.Label(speed_frame, textvariable=self.ang_var, width=6,
+                 relief='sunken').grid(row=1, column=1)
 
-        btns = [
-            ('W', 0, 1, lambda: self.set_motion(1, 0)),
-            ('A', 1, 0, lambda: self.set_motion(0, 1)),
-            ('STOP', 1, 1, self.stop),
-            ('D', 1, 2, lambda: self.set_motion(0, -1)),
-            ('S', 2, 1, lambda: self.set_motion(-1, 0)),
-        ]
-        for text, row, col, cb in btns:
-            b = ttk.Button(grid, text=text)
-            b.grid(row=row, column=col, sticky='nsew', padx=4, pady=4)
-            if text == 'STOP':
-                b.configure(command=cb)
-            else:
-                b.bind('<ButtonPress-1>', lambda _e, fn=cb: fn())
-                b.bind('<ButtonRelease-1>', lambda _e: self.stop())
-        for i in range(3):
-            grid.columnconfigure(i, weight=1)
+        # ── Odometry display ───────────────────────────────────────
+        odom_frame = tk.LabelFrame(self.root, text='Odometry', **pad)
+        odom_frame.grid(row=1, column=0, columnspan=3, sticky='ew', **pad)
 
-        speed = ttk.LabelFrame(main, text='Speed')
-        speed.pack(fill='x', **pad)
-        ttk.Label(speed, text='linear').grid(row=0, column=0, sticky='w')
-        ttk.Scale(speed, from_=0.0, to=LIN_MAX, variable=self.lin).grid(row=0, column=1, sticky='ew')
-        ttk.Label(speed, textvariable=self.lin).grid(row=0, column=2, sticky='e')
-        ttk.Label(speed, text='angular').grid(row=1, column=0, sticky='w')
-        ttk.Scale(speed, from_=0.0, to=ANG_MAX, variable=self.ang).grid(row=1, column=1, sticky='ew')
-        ttk.Label(speed, textvariable=self.ang).grid(row=1, column=2, sticky='e')
-        speed.columnconfigure(1, weight=1)
+        for col, label in enumerate(('x (m)', 'y (m)', 'yaw (°)')):
+            tk.Label(odom_frame, text=label).grid(row=0, column=col, **pad)
+        self.x_var = tk.StringVar(value='0.00')
+        self.y_var = tk.StringVar(value='0.00')
+        self.yaw_var = tk.StringVar(value='0.0')
+        for col, var in enumerate((self.x_var, self.y_var, self.yaw_var)):
+            tk.Label(odom_frame, textvariable=var, width=7,
+                     relief='sunken').grid(row=1, column=col, **pad)
 
-        status = ttk.LabelFrame(main, text='Status')
-        status.pack(fill='x', **pad)
-        ttk.Label(status, textvariable=self.state).pack(anchor='w')
-        ttk.Label(status, textvariable=self.odom).pack(anchor='w')
-        ttk.Label(status, textvariable=self.topics).pack(anchor='w')
+        # ── D-pad buttons ──────────────────────────────────────────
+        btn_frame = tk.LabelFrame(self.root, text='Controls  (WASD / ↑↓←→)', **pad)
+        btn_frame.grid(row=2, column=0, columnspan=3, **pad)
 
-    def set_motion(self, lin_dir, ang_dir):
-        self.lin_dir = float(lin_dir)
-        self.ang_dir = float(ang_dir)
-        self.publish()
+        btn_cfg = {'width': 4, 'height': 2}
+        tk.Button(btn_frame, text='↑\nFwd', command=self._fwd, **btn_cfg).grid(row=0, column=1)
+        tk.Button(btn_frame, text='←\nLeft', command=self._left, **btn_cfg).grid(row=1, column=0)
+        tk.Button(btn_frame, text='■\nStop', command=self._stop, **btn_cfg).grid(row=1, column=1)
+        tk.Button(btn_frame, text='→\nRight', command=self._right, **btn_cfg).grid(row=1, column=2)
+        tk.Button(btn_frame, text='↓\nBack', command=self._back, **btn_cfg).grid(row=2, column=1)
 
-    def publish(self):
-        lin = self.lin_dir * self.lin.get()
-        ang = self.ang_dir * self.ang.get()
-        self.node.send(lin, ang)
-        self.state.set(f'cmd: lin {lin:.2f} m/s   ang {ang:.2f} rad/s')
+        # ── Keyboard bindings ──────────────────────────────────────
+        for key in ('w', 'W', 'Up'):
+            self.root.bind(f'<{key}>', lambda _: self._fwd())
+        for key in ('s', 'S', 'Down'):
+            self.root.bind(f'<{key}>', lambda _: self._back())
+        for key in ('a', 'A', 'Left'):
+            self.root.bind(f'<{key}>', lambda _: self._left())
+        for key in ('d', 'D', 'Right'):
+            self.root.bind(f'<{key}>', lambda _: self._right())
+        self.root.bind('<space>', lambda _: self._stop())
 
-    def stop(self):
-        self.lin_dir = 0.0
-        self.ang_dir = 0.0
-        self.node.stop()
-        self.state.set('cmd: stopped')
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+        self._update_display()
 
-    def tick(self):
-        if self.running:
-            if self.lin_dir or self.ang_dir:
-                self.publish()
-            self.root.after(int(1000 / HZ), self.tick)
+    def _clamp_lin(self, v):
+        return max(-LIN_MAX, min(LIN_MAX, v))
 
-    def update_odom(self):
-        odom = self.node.odom
-        if odom is not None:
-            p = odom.pose.pose.position
-            yaw = yaw_from_quat(odom.pose.pose.orientation)
-            self.odom.set(f'odom: x {p.x:.2f}   y {p.y:.2f}   yaw {yaw:.2f}')
-        if self.running:
-            self.root.after(100, self.update_odom)
+    def _clamp_ang(self, v):
+        return max(-ANG_MAX, min(ANG_MAX, v))
 
-    def key_press(self, event):
-        key = event.keysym.lower()
-        self.active_keys.add(key)
-        if key == 'w':
-            self.set_motion(1, 0)
-        elif key == 's':
-            self.set_motion(-1, 0)
-        elif key == 'a':
-            self.set_motion(0, 1)
-        elif key == 'd':
-            self.set_motion(0, -1)
-        elif key == 'space':
-            self.stop()
+    def _fwd(self):
+        self.node.lin = self._clamp_lin(self.node.lin + STEP_LIN)
+        self.node.ang = 0.0
 
-    def key_release(self, event):
-        key = event.keysym.lower()
-        self.active_keys.discard(key)
-        if key in {'w', 'a', 's', 'd'}:
-            self.stop()
+    def _back(self):
+        self.node.lin = self._clamp_lin(self.node.lin - STEP_LIN)
+        self.node.ang = 0.0
 
-    def close(self):
-        self.running = False
-        self.node.stop()
+    def _left(self):
+        self.node.ang = self._clamp_ang(self.node.ang + STEP_ANG)
+
+    def _right(self):
+        self.node.ang = self._clamp_ang(self.node.ang - STEP_ANG)
+
+    def _stop(self):
+        self.node.lin = 0.0
+        self.node.ang = 0.0
+
+    def _update_display(self):
+        self.lin_var.set(f'{self.node.lin:+.2f}')
+        self.ang_var.set(f'{self.node.ang:+.2f}')
+        self.x_var.set(f'{self.node.x:.2f}')
+        self.y_var.set(f'{self.node.y:.2f}')
+        self.yaw_var.set(f'{math.degrees(self.node.yaw):.1f}')
+        self.root.after(100, self._update_display)
+
+    def _on_close(self):
+        self._stop()
         self.root.destroy()
 
     def run(self):
         self.root.mainloop()
 
 
-def spin_node(node, stop_event):
-    while rclpy.ok() and not stop_event.is_set():
-        rclpy.spin_once(node, timeout_sec=0.05)
-
-
-def main(args=None):
-    rclpy.init(args=args)
+def main():
+    rclpy.init()
     node = CtlNode()
-    stop_event = threading.Event()
-    thread = threading.Thread(target=spin_node, args=(node, stop_event), daemon=True)
-    thread.start()
-    gui = CtlGui(node)
-    try:
-        gui.run()
-    finally:
-        stop_event.set()
-        node.stop()
-        node.destroy_node()
-        rclpy.shutdown()
+    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    spin_thread.start()
+    gui = CtlGUI(node)
+    gui.run()
+    node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == '__main__':
