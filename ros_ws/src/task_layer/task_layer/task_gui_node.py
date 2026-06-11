@@ -47,6 +47,17 @@ def default_report_dir() -> str:
     return str(Path.home() / 'roboinspec_ws' / 'reports')
 
 
+def load_robot_registry() -> dict:
+    """robots.yaml is optional for the GUI: used to send each robot back to
+    its own dock; missing file/entries just fall back to runner defaults."""
+    try:
+        share_dir = get_package_share_directory('task_layer')
+        with (Path(share_dir) / 'config' / 'robots.yaml').open(encoding='utf-8') as f:
+            return (yaml.safe_load(f) or {}).get('robots', {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def yaw_to_quaternion(yaw: float):
     half = yaw * 0.5
     return math.sin(half), math.cos(half)
@@ -91,6 +102,7 @@ class TaskGuiNode(Node):
             action_name = f'/{ns}/navigate_to_pose' if ns else 'navigate_to_pose'
             self.nav_clients[ns] = ActionClient(self, NavigateToPose, action_name)
         self.active_robot = robots[0]
+        self.robot_registry = load_robot_registry()
         self.goal_handle = None
 
     @property
@@ -288,7 +300,7 @@ class TaskGui:
 
         right = ttk.Frame(body)
         right.pack(side='left', fill='both', expand=True, padx=(10, 0))
-        route_frame = ttk.LabelFrame(right, text='Route')
+        route_frame = ttk.LabelFrame(right, text='Target Rooms')
         route_frame.pack(fill='x')
         ttk.Entry(route_frame, textvariable=self.inspect_route_var).pack(fill='x', padx=6, pady=6)
         route_buttons = ttk.Frame(route_frame)
@@ -533,6 +545,15 @@ class TaskGui:
             '-p', f'return_home:={str(bool(self.return_home_var.get())).lower()}',
             '-p', f'report_dir:={report_dir}',
         ]
+        # Send the robot back to its own dock (see robots.yaml home_pose);
+        # without this the runner falls back to the shared robot_start.
+        home = (self.node.robot_registry.get(ns) or {}).get('home_pose') or {}
+        if {'x', 'y'} <= home.keys():
+            command += [
+                '-p', f'home_x:={float(home["x"])}',
+                '-p', f'home_y:={float(home["y"])}',
+                '-p', f'home_yaw:={float(home.get("yaw", 0.0))}',
+            ]
         try:
             log_file = open(log_path, 'w', encoding='utf-8')
             self.inspect_processes[ns] = subprocess.Popen(

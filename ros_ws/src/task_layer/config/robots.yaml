@@ -10,6 +10,7 @@ robots:
     nav_action: /tb3/navigate_to_pose
     amcl_pose_topic: /tb3/amcl_pose
     home_area: charging_station
+    home_pose: {x: -4.8, y: -3.825, yaw: -1.5708}   # south-wall charging dock
   arm:
     display_name: "Robot A - Mobile Manipulator"
     type: manipulator
@@ -17,3 +18,4 @@ robots:
     nav_action: /arm/navigate_to_pose
     amcl_pose_topic: /arm/amcl_pose
     home_area: mother_base
+    home_pose: {x: -4.8, y: -2.95, yaw: 1.5708}     # north-side dock, mirrors tb3

@@ -12,7 +12,7 @@ ROBOTS = [
     # Docked face-to-wall on opposite sides of the mother_base corridor:
     # tb3 at the south-wall charging station, arm mirrored on the north wall.
     {'ns': 'tb3', 'x': '-4.8', 'y': '-3.825', 'yaw': '-1.5708'},
-    {'ns': 'arm', 'x': '-4.8', 'y': '-2.78',  'yaw': '1.5708'},
+    {'ns': 'arm', 'x': '-4.8', 'y': '-2.95',  'yaw': '1.5708'},
 ]
 
 
