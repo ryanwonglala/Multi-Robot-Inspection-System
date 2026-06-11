@@ -119,6 +119,8 @@ areas:
   lab_room:
     display_name: Lab Room
     type: room
+    # Passage walled off (2026-06-10) to shrink the map; kept for reference.
+    accessible: false
     marker_model: lab_marker
     center:
     - -4.25
@@ -139,6 +141,8 @@ areas:
   prep_room:
     display_name: Prep Room
     type: room
+    # Passage walled off (2026-06-10) to shrink the map; kept for reference.
+    accessible: false
     marker_model: prep_room_marker
     center:
     - -8.15

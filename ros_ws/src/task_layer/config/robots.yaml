@@ -1,0 +1,19 @@
+# Robot registry — data source for the coordination layer (task_allocator,
+# and later the v0.4 action-based coordinator). Area keys reference
+# world_model.yaml; topic/action names are fully qualified because the
+# coordinator runs in the root namespace on the operator laptop.
+robots:
+  tb3:
+    display_name: "Robot B - TB3 Inspector"
+    type: inspector
+    capabilities: [navigate, lidar_scan, camera_capture]
+    nav_action: /tb3/navigate_to_pose
+    amcl_pose_topic: /tb3/amcl_pose
+    home_area: charging_station
+  arm:
+    display_name: "Robot A - Mobile Manipulator"
+    type: manipulator
+    capabilities: [navigate, manipulate]
+    nav_action: /arm/navigate_to_pose
+    amcl_pose_topic: /arm/amcl_pose
+    home_area: mother_base

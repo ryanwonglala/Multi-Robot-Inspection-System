@@ -11,9 +11,11 @@ ament_python_install_package(task_layer)
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME}/)
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME}/)
 install(DIRECTORY maps DESTINATION share/${PROJECT_NAME}/)
+install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME}/)
 install(DIRECTORY models/ DESTINATION share/${PROJECT_NAME}/models)
 
 install(PROGRAMS
+  task_layer/task_allocator.py
   task_layer/set_initial_pose_node.py
   task_layer/go_to_area_node.py
   task_layer/inspection_runner.py
