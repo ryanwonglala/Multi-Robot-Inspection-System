@@ -5,6 +5,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 WORLD_MODEL = os.path.join(
     get_package_share_directory('task_layer'),
@@ -25,6 +26,9 @@ ARGS = [
     DeclareLaunchArgument(
         'yaw', default_value='0.0',
         description='Default yaw for single-shot Navigate tab goals'),
+    DeclareLaunchArgument(
+        'robots', default_value="['tb3','arm']",
+        description="Robot namespaces the GUI commands. Legacy single robot: \"['']\""),
 ]
 
 
@@ -41,6 +45,9 @@ def generate_launch_description():
                 'world_model_path': LaunchConfiguration('world_model_path'),
                 'world': LaunchConfiguration('world'),
                 'yaw': LaunchConfiguration('yaw'),
+                # value_type=None -> the string is yaml-parsed into a list
+                'robots': ParameterValue(
+                    LaunchConfiguration('robots'), value_type=None),
             }],
         ),
     ])
