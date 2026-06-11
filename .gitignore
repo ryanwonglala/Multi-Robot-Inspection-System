@@ -3,6 +3,17 @@ github token.md
 experiments/
 .claude/
 
+# Internal planning docs & local artifacts — keep local, do not publish
+GIT_SOP.md
+ros_ws/doc/MASTER_PLAN.md
+ros_ws/doc/ARCHITECTURE_DECISIONS.md
+ros_ws/doc/COURSE_CONTEXT.md
+ros_ws/doc/PROJECT_PROPOSAL_SUMMARY.md
+ros_ws/doc/PROJECT_SNAPSHOT.md
+ros_ws/doc/FABLE5_MASTER_PROMPT.md
+ros_ws/doc/DEVLOG.md
+reports/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
