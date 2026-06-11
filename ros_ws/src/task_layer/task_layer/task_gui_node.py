@@ -75,7 +75,11 @@ class TaskGuiNode(Node):
 
         self.world_model = self.load_world_model()
         self.areas = self.world_model.get('areas', {})
-        self.area_items = list(self.areas.items())
+        # Accessible areas first; walled-off ones (accessible: false) sink to
+        # the end of every list and are not selectable in the GUI.
+        self.area_items = sorted(
+            self.areas.items(),
+            key=lambda item: not item[1].get('accessible', True))
         self.models = list_builtin_models()
         robots = [str(ns).strip().strip('/') for ns in
                   (self.get_parameter('robots').value or [])]
@@ -110,7 +114,10 @@ class TaskGuiNode(Node):
             index = int(query)
             if index < 1 or index > len(self.area_items):
                 raise ValueError(f'Area number must be 1..{len(self.area_items)}')
-            return self.area_items[index - 1]
+            key, area = self.area_items[index - 1]
+            if not area.get('accessible', True):
+                raise ValueError(f'Area {key} is walled off in the current map')
+            return key, area
 
         normalized = normalize_text(query)
         for key, area in self.area_items:
@@ -120,6 +127,9 @@ class TaskGuiNode(Node):
                 normalize_text(area.get('marker_model', '')),
             }
             if normalized in names:
+                if not area.get('accessible', True):
+                    raise ValueError(
+                        f'Area {key} is walled off in the current map')
                 return key, area
 
         raise ValueError(f'Unknown area: {query}')
@@ -165,6 +175,7 @@ class TaskGui:
         self.detail_var = tk.StringVar(value='')
         self.target_var = tk.StringVar()
         self.inspect_route_var = tk.StringVar()
+        self.inspect_mode_var = tk.StringVar(value='auto')
         self.max_attempts_var = tk.StringVar(value='2')
         self.spread_ratio_var = tk.StringVar(value='0.35')
         self.return_home_var = tk.BooleanVar(value=True)
@@ -233,7 +244,12 @@ class TaskGui:
         for index, (key, area) in enumerate(self.node.area_items, start=1):
             name = area.get('display_name', key)
             center = area.get('center', ['?', '?'])
-            area_list.insert('end', f'{index:02d}. {key} | {name} | ({center[0]}, {center[1]})')
+            if area.get('accessible', True):
+                label = f'{index:02d}. {key} | {name} | ({center[0]}, {center[1]})'
+                area_list.insert('end', label)
+            else:
+                area_list.insert('end', f'{index:02d}. {key} | {name} | (walled off)')
+                area_list.itemconfig('end', foreground='gray60')
         return frame, area_list
 
     def _build_nav_tab(self):
@@ -279,6 +295,15 @@ class TaskGui:
         route_buttons.pack(fill='x', padx=6, pady=(0, 6))
         ttk.Button(route_buttons, text='Add Selected', command=self.add_selected_area_to_route).pack(side='left')
         ttk.Button(route_buttons, text='Clear', command=lambda: self.inspect_route_var.set('')).pack(side='left', padx=(6, 0))
+
+        mode_frame = ttk.LabelFrame(right, text='Dispatch Mode')
+        mode_frame.pack(fill='x', pady=(10, 0))
+        ttk.Radiobutton(
+            mode_frame, text='Auto allocate (split route across all robots)',
+            variable=self.inspect_mode_var, value='auto').pack(anchor='w', padx=6)
+        ttk.Radiobutton(
+            mode_frame, text='Manual (active robot runs the whole route)',
+            variable=self.inspect_mode_var, value='manual').pack(anchor='w', padx=6)
 
         params = ttk.LabelFrame(right, text='Parameters')
         params.pack(fill='x', pady=(10, 0))
@@ -435,25 +460,62 @@ class TaskGui:
 
     def add_selected_area_to_route(self):
         try:
-            _index, (key, _area) = self.selected_area_from_list(self.inspect_area_list)
+            _index, (key, area) = self.selected_area_from_list(self.inspect_area_list)
         except ValueError as exc:
             messagebox.showerror('Route Error', str(exc))
+            return
+        if not area.get('accessible', True):
+            messagebox.showerror('Route Error', f'{key} is walled off in the current map')
             return
         current = [item.strip() for item in self.inspect_route_var.get().split(',') if item.strip()]
         current.append(key)
         self.inspect_route_var.set(','.join(current))
 
     def start_inspection(self):
+        route = self.inspect_route_var.get().strip()
+        if not route:
+            messagebox.showerror('Inspection Error', 'Route is empty')
+            return
+        if self.inspect_mode_var.get() == 'auto':
+            self.start_auto_inspection(route)
+        else:
+            self.start_manual_inspection(route)
+
+    def start_auto_inspection(self, route: str):
+        """Default dispatch: the operator names the rooms, the system splits
+        the route across robots (task_allocator) and runs them concurrently."""
+        if any(p and p.poll() is None for p in self.inspect_processes.values()):
+            messagebox.showinfo('Inspection Running',
+                                'An inspection is already running')
+            return
+        report_root = Path(self.node.get_parameter('report_dir').value)
+        report_root.mkdir(parents=True, exist_ok=True)
+        log_path = report_root / 'allocator_last_run.log'
+        command = [
+            'ros2', 'run', 'task_layer', 'task_allocator.py', '--ros-args',
+            '-p', f'use_sim_time:={str(bool(self.node.get_parameter("use_sim_time").value)).lower()}',
+            '-p', f'route:={route}',
+            '-p', f'return_home:={str(bool(self.return_home_var.get())).lower()}',
+            '-p', f'report_dir:={report_root}',
+        ]
+        try:
+            log_file = open(log_path, 'w', encoding='utf-8')
+            self.inspect_processes['__auto__'] = subprocess.Popen(
+                command, stdout=log_file, stderr=subprocess.STDOUT, text=True)
+            self.inspect_logs['__auto__'] = (log_file, log_path)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror('Inspection Error', str(exc))
+            return
+        self.inspect_status_var.set('[auto] allocating route across robots')
+        self.latest_report_var.set('')
+
+    def start_manual_inspection(self, route: str):
         ns = self.node.active_robot
         label = ns or 'root'
         running = self.inspect_processes.get(ns)
         if running and running.poll() is None:
             messagebox.showinfo('Inspection Running',
                                 f'[{label}] is already inspecting')
-            return
-        route = self.inspect_route_var.get().strip()
-        if not route:
-            messagebox.showerror('Inspection Error', 'Route is empty')
             return
         # Per-robot report dir; stdout goes to a file instead of a PIPE so a
         # long run can never deadlock on a full pipe buffer.
@@ -495,10 +557,16 @@ class TaskGui:
             output = ''
             if log_path and log_path.exists():
                 output = log_path.read_text(encoding='utf-8', errors='replace')
-            label = ns or 'root'
+            label = 'auto' if ns == '__auto__' else (ns or 'root')
             self.inspect_status_var.set(f'[{label}] inspection finished: code {return_code}')
-            report_line = self.extract_report_line(output)
-            self.latest_report_var.set(report_line or output.strip()[-300:])
+            if ns == '__auto__':
+                allocation = [line.split('Allocation:', 1)[1].strip()
+                              for line in output.splitlines() if 'Allocation:' in line]
+                self.latest_report_var.set(
+                    ' | '.join(allocation) or output.strip()[-300:])
+            else:
+                report_line = self.extract_report_line(output)
+                self.latest_report_var.set(report_line or output.strip()[-300:])
             self.inspect_processes[ns] = None
         self.root.after(500, self.poll_inspection)
 

@@ -111,6 +111,11 @@ class TaskAllocator(Node):
         if unknown:
             self.get_logger().error(f'Unknown areas: {unknown}')
             return 2
+        walled = [a for a in route
+                  if not self.world_model['areas'][a].get('accessible', True)]
+        if walled:
+            self.get_logger().error(f'Walled-off areas in route: {walled}')
+            return 2
 
         self.wait_for_poses()
         plan = self.allocate(route)

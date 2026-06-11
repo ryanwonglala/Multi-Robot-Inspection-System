@@ -17,8 +17,10 @@ from launch_ros.actions import Node
 # last namespace. Here every per-robot value is a literal, and each deferred
 # include evaluates atomically when its timer fires.
 ROBOTS = [
+    # Must match the spawn poses in sim/launch/multi_sim.launch.py:
+    # both robots docked on opposite walls of the mother_base corridor.
     {'ns': 'tb3', 'init_x': -4.8, 'init_y': -3.825, 'init_yaw': -1.5708},
-    {'ns': 'arm', 'init_x': -2.0, 'init_y': -3.3,   'init_yaw': 0.0},
+    {'ns': 'arm', 'init_x': -4.8, 'init_y': -2.78,  'init_yaw': 1.5708},
 ]
 
 
@@ -29,7 +31,10 @@ def generate_launch_description():
 
     map_yaml = os.path.join(pkg_task_layer, 'maps', 'tb3_map.yaml')
     params_file = os.path.join(pkg_task_layer, 'config', 'nav2_inspection.yaml')
-    rviz_config = os.path.join(pkg_nav2_bringup, 'rviz', 'nav2_namespaced_view.rviz')
+    # Dual view: full tb3 stack view + the arm's amcl_pose/plan overlaid in
+    # orange. Both map frames are physically aligned, so the arm overlays
+    # (map-frame topics) need no TF from the arm's tree.
+    rviz_config = os.path.join(pkg_task_layer, 'rviz', 'dual_view.rviz')
 
     # 1. Gazebo + both namespaced robots
     actions = [

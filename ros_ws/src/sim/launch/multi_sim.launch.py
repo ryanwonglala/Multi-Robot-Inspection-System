@@ -9,8 +9,10 @@ from launch_ros.actions import Node
 # Mid-term: Robot A's sim stand-in is also a burger_cam; the Final swaps in
 # the real mobile manipulator's model under the same 'arm' namespace.
 ROBOTS = [
-    {'ns': 'tb3', 'x': '-4.8', 'y': '-3.825', 'yaw': '-1.5708'},  # charging_station
-    {'ns': 'arm', 'x': '-2.0', 'y': '-3.3',   'yaw': '0.0'},      # east of mother_base
+    # Docked face-to-wall on opposite sides of the mother_base corridor:
+    # tb3 at the south-wall charging station, arm mirrored on the north wall.
+    {'ns': 'tb3', 'x': '-4.8', 'y': '-3.825', 'yaw': '-1.5708'},
+    {'ns': 'arm', 'x': '-4.8', 'y': '-2.78',  'yaw': '1.5708'},
 ]
 
 
