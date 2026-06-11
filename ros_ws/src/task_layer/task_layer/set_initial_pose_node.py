@@ -28,8 +28,10 @@ class SetInitialPoseNode(Node):
         self.declare_parameter('repeat_count', 10)
         self.declare_parameter('repeat_period_sec', 0.5)
 
+        # Relative topic so the node resolves to <ns>/initialpose when
+        # launched inside a robot namespace (multi-robot).
         self._pub = self.create_publisher(
-            PoseWithCovarianceStamped, '/initialpose', 10)
+            PoseWithCovarianceStamped, 'initialpose', 10)
         self._sent = 0
         self._repeat_count = int(self.get_parameter('repeat_count').value)
 
@@ -89,8 +91,7 @@ def main(args=None):
     except SystemExit:
         pass
     finally:
-        if node.handle:
-            node.destroy_node()
+        node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
