@@ -76,6 +76,11 @@ class InspectionRunner(Node):
         self.declare_parameter('report_dir', default_report_dir())
         self.declare_parameter('return_home', True)
         self.declare_parameter('home_area', 'charging_station')
+        # Per-robot home override (multi-robot: each robot has its own dock;
+        # the world_model robot_start is a single-robot legacy default).
+        self.declare_parameter('home_x', float('nan'))
+        self.declare_parameter('home_y', float('nan'))
+        self.declare_parameter('home_yaw', 0.0)
         self.declare_parameter('return_home_standoff_distance', 0.0)
         self.declare_parameter('dry_run', False)
 
@@ -363,6 +368,18 @@ class InspectionRunner(Node):
         return self._run_dir / f'{sequence_index:02d}_{safe_path_name(area_key)}'
 
     def home_pose(self, world_model: dict) -> dict:
+        home_x = float(self.get_parameter('home_x').value)
+        home_y = float(self.get_parameter('home_y').value)
+        if math.isfinite(home_x) and math.isfinite(home_y):
+            return {
+                'source': 'param_override',
+                'area': None,
+                'x': home_x,
+                'y': home_y,
+                'yaw': float(self.get_parameter('home_yaw').value),
+                'standoff_distance': 0.0,
+            }
+
         robot_start = world_model.get('robot_start') or {}
         start_pose = robot_start.get('pose') or {}
         if 'x' in start_pose and 'y' in start_pose:

@@ -17,6 +17,8 @@ import time
 
 import rclpy
 from geometry_msgs.msg import PoseWithCovarianceStamped
+from nav2_msgs.action import NavigateToPose
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import (
     QoSDurabilityPolicy,
@@ -78,9 +80,13 @@ class TaskAllocator(Node):
         # Robots without a live amcl_pose fall back to their home area center.
         for ns, info in self.robots.items():
             if ns not in self.robot_poses:
-                self.robot_poses[ns] = self.area_center(info['home_area'])
+                home = info.get('home_pose') or {}
+                if {'x', 'y'} <= home.keys():
+                    self.robot_poses[ns] = (float(home['x']), float(home['y']))
+                else:
+                    self.robot_poses[ns] = self.area_center(info['home_area'])
                 self.get_logger().warn(
-                    f'{ns}: no amcl_pose received, using {info["home_area"]} center')
+                    f'{ns}: no amcl_pose received, assuming home position')
 
     def allocate(self, route: list[str]) -> dict[str, list[str]]:
         """Greedy with a per-robot quota: each area goes to the robot whose
@@ -123,7 +129,6 @@ class TaskAllocator(Node):
             self.get_logger().info(f'Allocation: {ns} -> {areas or "(idle)"}')
 
         use_sim_time = str(bool(self.get_parameter('use_sim_time').value)).lower()
-        return_home = str(bool(self.get_parameter('return_home').value)).lower()
         report_root = Path(self.get_parameter('report_dir').value)
         procs = {}
         for ns, areas in plan.items():
@@ -131,12 +136,17 @@ class TaskAllocator(Node):
                 continue
             report_dir = report_root / ns
             report_dir.mkdir(parents=True, exist_ok=True)
+            # Runners never return home on their own: with several robots
+            # finishing around the same time their return paths funnel into
+            # the same doorways and they wedge each other (observed: both
+            # crossing the mother_base doorway simultaneously). The allocator
+            # sends the robots home ONE AT A TIME afterwards instead.
             command = [
                 'ros2', 'run', 'task_layer', 'inspection_runner.py', '--ros-args',
                 '-r', f'__ns:=/{ns}',
                 '-p', f'use_sim_time:={use_sim_time}',
                 '-p', f"route:={','.join(areas)}",
-                '-p', f'return_home:={return_home}',
+                '-p', 'return_home:=false',
                 '-p', f'report_dir:={report_dir}',
             ]
             log_file = open(report_dir / 'allocator_run.log', 'w', encoding='utf-8')
@@ -149,7 +159,50 @@ class TaskAllocator(Node):
             codes[ns] = process.wait()
             log_file.close()
             self.get_logger().info(f'{ns}: finished with code {codes[ns]}')
+
+        if bool(self.get_parameter('return_home').value):
+            for ns in procs:
+                if not self.send_home(ns):
+                    codes[ns] = codes.get(ns) or 6
         return 0 if all(code == 0 for code in codes.values()) else 5
+
+    def send_home(self, ns: str, timeout_sec: float = 180.0) -> bool:
+        """Sequential return: one robot moves at a time so end-of-mission
+        paths cannot contend for the same doorway."""
+        home = (self.robots[ns].get('home_pose') or {})
+        if not {'x', 'y'} <= home.keys():
+            self.get_logger().warn(f'{ns}: no home_pose in robots.yaml, skipping return')
+            return True
+        client = ActionClient(self, NavigateToPose, self.robots[ns]['nav_action'])
+        if not client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error(f'{ns}: nav action server unavailable for return')
+            return False
+        yaw = float(home.get('yaw', 0.0))
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = float(home['x'])
+        goal.pose.pose.position.y = float(home['y'])
+        goal.pose.pose.orientation.z = math.sin(yaw * 0.5)
+        goal.pose.pose.orientation.w = math.cos(yaw * 0.5)
+        self.get_logger().info(
+            f"{ns}: returning home x={home['x']} y={home['y']}")
+        send_future = client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=15.0)
+        handle = send_future.result()
+        if handle is None or not handle.accepted:
+            self.get_logger().error(f'{ns}: return-home goal rejected')
+            return False
+        result_future = handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future, timeout_sec=timeout_sec)
+        result = result_future.result()
+        ok = result is not None and result.status == 4  # STATUS_SUCCEEDED
+        status = getattr(result, 'status', 'timeout')
+        if ok:
+            self.get_logger().info(f'{ns}: return home succeeded')
+        else:
+            self.get_logger().error(f'{ns}: return home failed (status {status})')
+        return ok
 
 
 def main(args=None):

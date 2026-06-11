@@ -20,7 +20,7 @@ ROBOTS = [
     # Must match the spawn poses in sim/launch/multi_sim.launch.py:
     # both robots docked on opposite walls of the mother_base corridor.
     {'ns': 'tb3', 'init_x': -4.8, 'init_y': -3.825, 'init_yaw': -1.5708},
-    {'ns': 'arm', 'init_x': -4.8, 'init_y': -2.78,  'init_yaw': 1.5708},
+    {'ns': 'arm', 'init_x': -4.8, 'init_y': -2.95,  'init_yaw': 1.5708},
 ]
 
 
