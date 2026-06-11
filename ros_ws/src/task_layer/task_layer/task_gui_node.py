@@ -44,7 +44,7 @@ def default_world_model_path() -> str:
 
 
 def default_report_dir() -> str:
-    return '/home/sutd/roboinspec_ws/reports'
+    return str(Path.home() / 'roboinspec_ws' / 'reports')
 
 
 def yaw_to_quaternion(yaw: float):

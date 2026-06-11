@@ -11,16 +11,13 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-# ── Paths resolved at import time (not inside generate_launch_description)
-# so they appear in --show-args output correctly.
-MAP_YAML = '/home/sutd/roboinspec_ws/maps/tb3_map.yaml'
-
-
 def generate_launch_description():
     pkg_sim = get_package_share_directory('sim')
     pkg_task_layer = get_package_share_directory('task_layer')
     pkg_nav2_bringup = get_package_share_directory('nav2_bringup')
 
+    # Map ships inside the package so any clone/machine resolves it the same way.
+    default_map = os.path.join(pkg_task_layer, 'maps', 'tb3_map.yaml')
     params_file = os.path.join(pkg_task_layer, 'config', 'nav2_inspection.yaml')
     rviz_config = os.path.join(pkg_nav2_bringup, 'rviz', 'nav2_default_view.rviz')
 
@@ -29,7 +26,7 @@ def generate_launch_description():
         description='Use Gazebo simulation clock')
 
     declare_map = DeclareLaunchArgument(
-        'map', default_value=MAP_YAML,
+        'map', default_value=default_map,
         description='Full path to SLAM map YAML file')
 
     declare_params = DeclareLaunchArgument(

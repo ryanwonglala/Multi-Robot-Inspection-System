@@ -71,7 +71,7 @@ class InspectionRunner(Node):
         self.declare_parameter('scan_yaws', [0.0, 1.5708, 3.1416, -1.5708])
         self.declare_parameter('scan_settle_sec', 1.0)
         self.declare_parameter('scan_topic', 'scan')
-        self.declare_parameter('image_topic', '/camera/image_raw')
+        self.declare_parameter('image_topic', 'camera/image_raw')
         self.declare_parameter('camera_settle_sec', 1.0)
         self.declare_parameter('report_dir', default_report_dir())
         self.declare_parameter('return_home', True)
