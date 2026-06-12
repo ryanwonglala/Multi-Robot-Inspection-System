@@ -581,10 +581,15 @@ class TaskGui:
             label = 'auto' if ns == '__auto__' else (ns or 'root')
             self.inspect_status_var.set(f'[{label}] inspection finished: code {return_code}')
             if ns == '__auto__':
+                mission_report = ''
+                for line in output.splitlines():
+                    if 'Mission report written:' in line:
+                        mission_report = line.split(
+                            'Mission report written:', 1)[1].strip()
                 allocation = [line.split('Allocation:', 1)[1].strip()
                               for line in output.splitlines() if 'Allocation:' in line]
                 self.latest_report_var.set(
-                    ' | '.join(allocation) or output.strip()[-300:])
+                    mission_report or ' | '.join(allocation) or output.strip()[-300:])
             else:
                 report_line = self.extract_report_line(output)
                 self.latest_report_var.set(report_line or output.strip()[-300:])
