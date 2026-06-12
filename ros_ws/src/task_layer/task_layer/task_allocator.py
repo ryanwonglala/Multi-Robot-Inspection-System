@@ -17,7 +17,7 @@ import time
 
 import rclpy
 from geometry_msgs.msg import PoseWithCovarianceStamped
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import ComputePathToPose, NavigateToPose
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import (
@@ -50,9 +50,14 @@ class TaskAllocator(Node):
             pass
 
         with open(self.get_parameter('robots_yaml').value, encoding='utf-8') as f:
-            self.robots = yaml.safe_load(f)['robots']
+            registry = yaml.safe_load(f)
+        self.robots = registry['robots']
+        self.home_gate = registry.get('home_gate') or {}
         with open(self.get_parameter('world_model_path').value, encoding='utf-8') as f:
             self.world_model = yaml.safe_load(f)
+
+        self._plan_clients: dict = {}   # ns -> ActionClient | False (unavailable)
+        self._cost_cache: dict = {}     # (ns, start_xy, area) -> meters
 
         # AMCL latches its last pose (transient_local); a default volatile
         # subscription would never see it for a robot that is standing still.
@@ -88,22 +93,82 @@ class TaskAllocator(Node):
                 self.get_logger().warn(
                     f'{ns}: no amcl_pose received, assuming home position')
 
+    def path_length(self, ns: str, start: tuple, goal: tuple) -> float | None:
+        """Planner-reported path length in meters, or None when the robot's
+        planner is unavailable or finds no path."""
+        client = self._plan_clients.get(ns)
+        if client is False:
+            return None
+        if client is None:
+            action_name = (self.robots[ns]['nav_action'].rsplit('/', 1)[0]
+                           + '/compute_path_to_pose')
+            client = ActionClient(self, ComputePathToPose, action_name)
+            if not client.wait_for_server(timeout_sec=2.0):
+                self.get_logger().warn(
+                    f'{ns}: planner unavailable, using straight-line distances')
+                self._plan_clients[ns] = False
+                return None
+            self._plan_clients[ns] = client
+        goal_msg = ComputePathToPose.Goal()
+        goal_msg.use_start = True
+        goal_msg.start.header.frame_id = 'map'
+        goal_msg.start.pose.position.x = float(start[0])
+        goal_msg.start.pose.position.y = float(start[1])
+        goal_msg.start.pose.orientation.w = 1.0
+        goal_msg.goal.header.frame_id = 'map'
+        goal_msg.goal.pose.position.x = float(goal[0])
+        goal_msg.goal.pose.position.y = float(goal[1])
+        goal_msg.goal.pose.orientation.w = 1.0
+        send_future = client.send_goal_async(goal_msg)
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=3.0)
+        handle = send_future.result()
+        if handle is None or not handle.accepted:
+            return None
+        result_future = handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future, timeout_sec=5.0)
+        result = result_future.result()
+        if result is None:
+            return None
+        poses = result.result.path.poses
+        if len(poses) < 2:
+            return None
+        return sum(
+            math.hypot(b.pose.position.x - a.pose.position.x,
+                       b.pose.position.y - a.pose.position.y)
+            for a, b in zip(poses, poses[1:]))
+
+    def travel_cost(self, ns: str, start: tuple, area_key: str) -> float:
+        """Real path length from start to the area center (walls count);
+        straight-line fallback keeps allocation alive without a planner."""
+        key = (ns, start, area_key)
+        if key not in self._cost_cache:
+            goal = self.area_center(area_key)
+            length = self.path_length(ns, start, goal)
+            if length is None:
+                length = math.hypot(start[0] - goal[0], start[1] - goal[1])
+            self._cost_cache[key] = length
+        return self._cost_cache[key]
+
     def allocate(self, route: list[str]) -> dict[str, list[str]]:
-        """Greedy with a per-robot quota: each area goes to the robot whose
-        *virtual* position is closest to the area center; that robot's
-        virtual position then moves there. The quota (ceil(N/robots)) stops
-        the greedy cascade where one robot that is 'on the way' swallows the
-        whole route while the others idle."""
+        """Cheapest (robot, area) pair first, repeated until the route is
+        exhausted. Costs are planner path lengths from each robot's *virtual*
+        position (it moves onto an area once assigned), so the split ignores
+        the order the operator picked the rooms in and walls between a robot
+        and a room count at their detour cost. The quota (ceil(N/robots))
+        stops the greedy cascade where one robot that is 'on the way'
+        swallows the whole route while the others idle."""
         quota = math.ceil(len(route) / max(len(self.robots), 1))
         cursor = dict(self.robot_poses)
         plan: dict[str, list[str]] = {ns: [] for ns in self.robots}
-        for area_key in route:
-            ax, ay = self.area_center(area_key)
+        remaining = list(route)
+        while remaining:
             candidates = [ns for ns in cursor if len(plan[ns]) < quota]
-            best = min(candidates, key=lambda ns: math.hypot(
-                cursor[ns][0] - ax, cursor[ns][1] - ay))
+            _, best, area_key = min(
+                (self.travel_cost(ns, cursor[ns], area), ns, area)
+                for ns in candidates for area in remaining)
             plan[best].append(area_key)
-            cursor[best] = (ax, ay)
+            cursor[best] = self.area_center(area_key)
+            remaining.remove(area_key)
         return plan
 
     def run_once(self) -> int:
@@ -136,11 +201,10 @@ class TaskAllocator(Node):
                 continue
             report_dir = report_root / ns
             report_dir.mkdir(parents=True, exist_ok=True)
-            # Runners never return home on their own: with several robots
-            # finishing around the same time their return paths funnel into
-            # the same doorways and they wedge each other (observed: both
-            # crossing the mother_base doorway simultaneously). The allocator
-            # sends the robots home ONE AT A TIME afterwards instead.
+            # Runners never return home on their own: the allocator owns the
+            # end-of-mission return so it can arbitrate the shared doorway
+            # into the mother_base bay (unmanaged simultaneous returns wedged
+            # each other in that opening). See return_all_home().
             command = [
                 'ros2', 'run', 'task_layer', 'inspection_runner.py', '--ros-args',
                 '-r', f'__ns:=/{ns}',
@@ -161,22 +225,14 @@ class TaskAllocator(Node):
             self.get_logger().info(f'{ns}: finished with code {codes[ns]}')
 
         if bool(self.get_parameter('return_home').value):
-            for ns in procs:
-                if not self.send_home(ns):
+            results = self.return_all_home(list(procs))
+            for ns, ok in results.items():
+                if not ok:
                     codes[ns] = codes.get(ns) or 6
         return 0 if all(code == 0 for code in codes.values()) else 5
 
-    def send_home(self, ns: str, timeout_sec: float = 180.0) -> bool:
-        """Sequential return: one robot moves at a time so end-of-mission
-        paths cannot contend for the same doorway."""
-        home = (self.robots[ns].get('home_pose') or {})
-        if not {'x', 'y'} <= home.keys():
-            self.get_logger().warn(f'{ns}: no home_pose in robots.yaml, skipping return')
-            return True
-        client = ActionClient(self, NavigateToPose, self.robots[ns]['nav_action'])
-        if not client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().error(f'{ns}: nav action server unavailable for return')
-            return False
+    def _home_goal(self, ns: str) -> NavigateToPose.Goal:
+        home = self.robots[ns]['home_pose']
         yaw = float(home.get('yaw', 0.0))
         goal = NavigateToPose.Goal()
         goal.pose.header.frame_id = 'map'
@@ -185,24 +241,106 @@ class TaskAllocator(Node):
         goal.pose.pose.position.y = float(home['y'])
         goal.pose.pose.orientation.z = math.sin(yaw * 0.5)
         goal.pose.pose.orientation.w = math.cos(yaw * 0.5)
-        self.get_logger().info(
-            f"{ns}: returning home x={home['x']} y={home['y']}")
-        send_future = client.send_goal_async(goal)
+        return goal
+
+    def _start_home(self, ns: str, state: dict):
+        send_future = state['client'].send_goal_async(self._home_goal(ns))
         rclpy.spin_until_future_complete(self, send_future, timeout_sec=15.0)
         handle = send_future.result()
         if handle is None or not handle.accepted:
             self.get_logger().error(f'{ns}: return-home goal rejected')
-            return False
-        result_future = handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future, timeout_sec=timeout_sec)
-        result = result_future.result()
-        ok = result is not None and result.status == 4  # STATUS_SUCCEEDED
-        status = getattr(result, 'status', 'timeout')
-        if ok:
-            self.get_logger().info(f'{ns}: return home succeeded')
-        else:
-            self.get_logger().error(f'{ns}: return home failed (status {status})')
-        return ok
+            state['state'] = 'failed'
+            return
+        state['handle'] = handle
+        state['result_future'] = handle.get_result_async()
+        state['state'] = 'driving'
+
+    def return_all_home(self, ns_list: list[str],
+                        timeout_sec: float = 300.0) -> dict[str, bool]:
+        """Concurrent return with a doorway mutex: every robot drives home at
+        once, but only one at a time may thread the funnel into the
+        mother_base bay (simultaneous unmanaged returns wedged there). A
+        robot approaching a held gate is cancelled in place and re-sent once
+        the holder has cleared the zone."""
+        gate_x = float(self.home_gate.get('x', -1.65))
+        gate_y = float(self.home_gate.get('y', -3.3))
+        gate_radius = float(self.home_gate.get('radius', 1.0))
+        hold_radius = gate_radius + 0.7  # stop before physically entering
+
+        states: dict[str, dict] = {}
+        for ns in ns_list:
+            home = self.robots[ns].get('home_pose') or {}
+            if not {'x', 'y'} <= home.keys():
+                self.get_logger().warn(
+                    f'{ns}: no home_pose in robots.yaml, skipping return')
+                continue
+            client = ActionClient(self, NavigateToPose, self.robots[ns]['nav_action'])
+            if not client.wait_for_server(timeout_sec=10.0):
+                self.get_logger().error(f'{ns}: nav action server unavailable for return')
+                states[ns] = {'state': 'failed', 'handle': None}
+                continue
+            states[ns] = {'client': client, 'state': 'init',
+                          'handle': None, 'result_future': None}
+            self.get_logger().info(
+                f"{ns}: returning home x={home['x']} y={home['y']}")
+            self._start_home(ns, states[ns])
+
+        def gate_dist(ns: str) -> float:
+            px, py = self.robot_poses.get(ns, (math.inf, math.inf))
+            return math.hypot(px - gate_x, py - gate_y)
+
+        def past_gate(ns: str) -> bool:
+            # Already closer to its dock than the gate is: it has threaded
+            # the funnel and must not be held on the inside (observed: a
+            # robot paused pointlessly in the bay right after passing).
+            home = self.robots[ns]['home_pose']
+            hx, hy = float(home['x']), float(home['y'])
+            px, py = self.robot_poses.get(ns, (math.inf, math.inf))
+            return math.hypot(px - hx, py - hy) < math.hypot(gate_x - hx, gate_y - hy)
+
+        holder = None
+        deadline = time.time() + timeout_sec
+        while (time.time() < deadline
+               and any(s['state'] in ('driving', 'held') for s in states.values())):
+            rclpy.spin_once(self, timeout_sec=0.1)
+            for ns, st in states.items():
+                if st['state'] == 'driving' and st['result_future'].done():
+                    result = st['result_future'].result()
+                    if result is not None and result.status == 4:  # SUCCEEDED
+                        st['state'] = 'done'
+                        self.get_logger().info(f'{ns}: return home succeeded')
+                    else:
+                        st['state'] = 'failed'
+                        status = getattr(result, 'status', 'no result')
+                        self.get_logger().error(
+                            f'{ns}: return home failed (status {status})')
+            # The holder keeps the gate while it is inside and still driving.
+            if holder is not None and (states[holder]['state'] != 'driving'
+                                       or gate_dist(holder) > gate_radius):
+                holder = None
+            if holder is None:
+                inside = [ns for ns, st in states.items()
+                          if st['state'] == 'driving' and gate_dist(ns) <= gate_radius]
+                if inside:
+                    holder = min(inside, key=gate_dist)
+            for ns, st in states.items():
+                if ns == holder:
+                    continue
+                if (holder is not None and st['state'] == 'driving'
+                        and gate_dist(ns) <= hold_radius and not past_gate(ns)):
+                    st['handle'].cancel_goal_async()
+                    st['state'] = 'held'
+                    self.get_logger().info(
+                        f'{ns}: holding before home gate ({holder} is inside)')
+                elif holder is None and st['state'] == 'held':
+                    self.get_logger().info(f'{ns}: gate clear, resuming return')
+                    self._start_home(ns, st)
+        for ns, st in states.items():
+            if st['state'] in ('driving', 'held'):
+                self.get_logger().error(f'{ns}: return home timed out')
+                if st.get('handle') is not None:
+                    st['handle'].cancel_goal_async()
+        return {ns: st['state'] == 'done' for ns, st in states.items()}
 
 
 def main(args=None):
