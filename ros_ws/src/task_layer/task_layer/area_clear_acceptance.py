@@ -122,6 +122,21 @@ class AreaClearAcceptance(Node):
         self._own_pose = (p.position.x, p.position.y, yaw_of(p.orientation),
                           list(msg.pose.covariance))
 
+    def area_bounds(self, key: str, margin: float = 0.30):
+        """Bounds of the inspected area shrunk by `margin`, for the
+        checker's out-of-area anomaly filter. Explicit stop labels map to
+        their area by progressively stripping _suffixes (east_hall_w ->
+        east_hall); unmatched labels get no bounds filter."""
+        areas = self.world_model['areas']
+        k = key
+        while k and k not in areas:
+            k = k.rsplit('_', 1)[0] if '_' in k else ''
+        bounds = areas.get(k, {}).get('bounds') if k else None
+        if not bounds:
+            return None
+        return (float(bounds['x_min']) + margin, float(bounds['y_min']) + margin,
+                float(bounds['x_max']) - margin, float(bounds['y_max']) - margin)
+
     def goto(self, x: float, y: float) -> str:
         if not self._nav.wait_for_server(timeout_sec=10.0):
             return 'server_unavailable'
@@ -211,7 +226,8 @@ class AreaClearAcceptance(Node):
                                         f'skipped_misaligned,,,{std},{align:.2f}')
                         break
                     report = self.checker.check(scans, (x, y, yaw),
-                                                peers=list(self._peer_poses.values()))
+                                                peers=list(self._peer_poses.values()),
+                                                bounds=self.area_bounds(area_key))
                     report['alignment'] = round(align, 3)
                     stops += 1
                     n = len(report['anomalies'])
