@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import random
 import re
 import subprocess
@@ -338,3 +339,7 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
     sys.exit(return_code)
+
+
+if __name__ == '__main__':
+    main()

@@ -24,6 +24,7 @@ install(PROGRAMS
   task_layer/scan_analyzer.py
   task_layer/report_writer.py
   task_layer/scene_builder_gui_node.py
+  task_layer/area_clear_acceptance.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
