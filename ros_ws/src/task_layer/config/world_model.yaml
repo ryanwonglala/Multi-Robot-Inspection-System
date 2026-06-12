@@ -195,6 +195,17 @@ areas:
       x_max: 9.370819664
       y_min: -1.15
       y_max: 2.85
+    # 大厅 7.2m 长轴超激光直径（2×3.5m）：中心站位 AMCL 沿轴失约束
+    # （P1-4 实测 std 0.76+，自旋也救不回）。改为东西双观测点都要到访，
+    # 检测结果跨视角合并（runner viewpoints_visit_all 机制）。
+    viewpoints:
+    - x: 4.0
+      y: 0.85
+      yaw: 0.0
+    - x: 7.5
+      y: 0.85
+      yaw: 3.1416
+    viewpoints_visit_all: true
     color_rgba:
     - 0.78
     - 0.92

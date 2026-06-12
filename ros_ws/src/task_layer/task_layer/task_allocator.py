@@ -293,8 +293,15 @@ class TaskAllocator(Node):
 #   return_home      succeeded = 已回到自己的充电桩
 #   detail_report    该机器人的完整机读报告路径（本文件是给人看的汇总）
 #
-# 注：v0.3 报告记录"执行与取证"；激光/视觉异常判读将在 P1-5 接入后出现在
-#     anomalies 字段中。
+#   mission.anomaly_count  本次任务发现的异常总数（激光-地图差分检出）
+#   anomalies        异常清单，每条含：发现机器人/区域/map 坐标/尺寸/取证照
+#       type=center_relocated_prior 表示"巡检点被占被迫改址"——它不是确认的
+#       异常物体，而是一条先验线索（有东西占着该去的位置）
+#   robots.<机器人>.areas[].area_clear_status  到点检测结果：
+#       checked=已检 / skipped_uncertain_pose=定位不稳跳过 /
+#       skipped_misaligned=扫描与地图对不齐跳过（均为诚实弃权，非故障）
+#
+# 注：异常坐标在 map 系，误差地板≈AMCL 定位误差（实测 0.1~0.3m）。
 # ==========================================================================
 """
 
@@ -305,6 +312,7 @@ class TaskAllocator(Node):
         """Merge every runner's report.yaml into one annotated, human-first
         file at the top of the mission directory."""
         return_enabled = bool(self.get_parameter('return_home').value)
+        mission_anomalies: list[dict] = []
         robots: dict[str, dict] = {}
         for ns, areas in plan.items():
             if not areas:
@@ -328,8 +336,12 @@ class TaskAllocator(Node):
                     'status': a.get('status'),
                     'photos': a.get('captured_image_count', 0),
                     'evidence_dir': a.get('evidence_dir'),
+                    **({'area_clear_status': a['area_clear_status']}
+                       if a.get('area_clear_status') else {}),
                     **({'reason': a['reason']} if a.get('reason') else {}),
                 } for a in data.get('areas', [])]
+                for anomaly in data.get('anomalies', []):
+                    mission_anomalies.append({'robot': ns, **anomaly})
                 entry['detail_report'] = str(report_file)
             if not return_enabled:
                 entry['return_home'] = 'disabled'
@@ -343,6 +355,8 @@ class TaskAllocator(Node):
 
         all_ok = (all(code == 0 for code in codes.values())
                   and (not return_enabled or all(return_results.values())))
+        confirmed = [a for a in mission_anomalies
+                     if a.get('type') != 'center_relocated_prior']
         mission = {
             'mission': {
                 'generated_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -350,7 +364,9 @@ class TaskAllocator(Node):
                 'route_requested': route,
                 'allocation': {ns: list(areas) for ns, areas in plan.items()},
                 'status': 'completed' if all_ok else 'completed_with_failures',
+                'anomaly_count': len(confirmed),
             },
+            'anomalies': mission_anomalies,
             'robots': robots,
         }
         mission_dir.mkdir(parents=True, exist_ok=True)
