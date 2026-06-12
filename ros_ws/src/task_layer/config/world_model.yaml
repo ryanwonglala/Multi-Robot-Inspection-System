@@ -255,6 +255,17 @@ areas:
       x_max: 8.2
       y_min: 2.775
       y_max: 3.225
+    # 禁区只许"站门口朝里看"：门条带太窄，生成式候选点全被边界内缩
+    # 滤掉（实测 unchecked）。显式观测位姿：门南缘居中、面朝室内（+90°）。
+    viewpoints:
+    - x: 7.5
+      y: 2.8
+      yaw: 1.5708
+    # 不做 360° 环拍，只朝室内三个方向取证（西北/正北/东北）。
+    scan_yaws:
+    - 2.3562
+    - 1.5708
+    - 0.7854
     color_rgba:
     - 0.949999988
     - 0.340000004
@@ -264,6 +275,9 @@ areas:
     display_name: Restricted Zone
     type: controlled_area
     marker_model: restricted_marker
+    # 政策禁入：机器人只在 restricted_gate 门口向内巡视，不进房。
+    # GUI 置灰 + allocator 路由校验拒绝（与 lab/prep 同一机制）。
+    accessible: false
     center:
     - 7.96041
     - 4.75
