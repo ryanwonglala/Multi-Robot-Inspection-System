@@ -601,6 +601,17 @@ class TaskGui:
         self.latest_report_var.set('')
 
     def poll_inspection(self):
+        # The reschedule lives in `finally`: one exception in a poll pass must
+        # not silently kill the whole loop (anomaly text, allocation, finish
+        # status all stop updating with zero feedback).
+        try:
+            self._poll_inspection_once()
+        except Exception as exc:  # noqa: BLE001
+            self.node.get_logger().error(f'poll_inspection: {exc!r}')
+        finally:
+            self.root.after(500, self.poll_inspection)
+
+    def _poll_inspection_once(self):
         events = self.node.anomaly_events
         if len(events) != self._anomaly_seen:
             self._anomaly_seen = len(events)
@@ -642,7 +653,6 @@ class TaskGui:
                 report_line = self.extract_report_line(output)
                 self.latest_report_var.set(report_line or output.strip()[-300:])
             self.inspect_processes[ns] = None
-        self.root.after(500, self.poll_inspection)
 
     def update_allocation_display(self):
         """Tail the running allocator's log and surface the route split the
@@ -663,6 +673,8 @@ class TaskGui:
                                 .replace("', '", ', '))
         if plan:
             self.allocation_var.set('Allocation:\n' + '\n'.join(plan))
+
+    def extract_report_line(self, output: str) -> str:
         for line in output.splitlines():
             if 'Inspection report written:' in line:
                 return line.split('Inspection report written:', 1)[1].strip()
