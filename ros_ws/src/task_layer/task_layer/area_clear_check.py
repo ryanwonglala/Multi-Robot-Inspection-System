@@ -144,10 +144,19 @@ class AreaClearChecker:
             angle += scan.angle_increment
             if not math.isfinite(r) or not (scan.range_min < r < scan.range_max):
                 continue
-            total += 1
             col = int((lx + r * math.cos(beam_angle) - self.ox) / self.res)
             row = int((ly + r * math.sin(beam_angle) - self.oy) / self.res)
-            if 0 <= row < rows and 0 <= col < cols and self.near_blocked[row, col]:
+            inside = 0 <= row < rows and 0 <= col < cols
+            if (inside and r <= self.max_detect_range_m
+                    and self.deep_free[row, col]):
+                # Candidate anomaly evidence: a real object in deep free
+                # space must not drag the ratio down and gate itself out.
+                # Misprojection displaces returns by error*range, so its
+                # signature lives at long range (observed at 2.75-3.2 m)
+                # and still lands in the denominator.
+                continue
+            total += 1
+            if inside and self.near_blocked[row, col]:
                 matched += 1
         return matched / total if total else 0.0
 
