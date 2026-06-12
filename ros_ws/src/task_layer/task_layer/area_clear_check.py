@@ -69,7 +69,7 @@ def merge_detections(existing: list[dict], new: list[dict],
 
 
 class AreaClearChecker:
-    def __init__(self, map_yaml_path, clearance_m: float = 0.30,
+    def __init__(self, map_yaml_path, clearance_m: float = 0.40,
                  cluster_link_m: float = 0.30, min_cluster_cells: int = 5,
                  min_hit_frames: int = 4, peer_radius_m: float = 0.35,
                  lidar_offset_x: float = -0.032, max_evidence_cells: int = 800,
@@ -144,16 +144,32 @@ class AreaClearChecker:
             angle += scan.angle_increment
             if not math.isfinite(r) or not (scan.range_min < r < scan.range_max):
                 continue
-            total += 1
             col = int((lx + r * math.cos(beam_angle) - self.ox) / self.res)
             row = int((ly + r * math.sin(beam_angle) - self.oy) / self.res)
-            if 0 <= row < rows and 0 <= col < cols and self.near_blocked[row, col]:
+            inside = 0 <= row < rows and 0 <= col < cols
+            if (inside and r <= self.max_detect_range_m
+                    and self.deep_free[row, col]):
+                # Candidate anomaly evidence: a real object in deep free
+                # space must not drag the ratio down and gate itself out.
+                # Misprojection displaces returns by error*range, so its
+                # signature lives at long range (observed at 2.75-3.2 m)
+                # and still lands in the denominator.
+                continue
+            total += 1
+            if inside and self.near_blocked[row, col]:
                 matched += 1
         return matched / total if total else 0.0
 
-    def check(self, scans, pose, peers=()) -> dict:
+    def check(self, scans, pose, peers=(), bounds=None) -> dict:
         """scans: LaserScan-like objects taken while stationary;
-        pose: (x, y, yaw) of base in map frame; peers: [(x, y), ...].
+        pose: (x, y, yaw) of base in map frame; peers: [(x, y), ...];
+        bounds: optional (x_min, y_min, x_max, y_max) — anomalies whose
+        centroid falls outside are dropped. Pass the inspected area's
+        bounds shrunk by ~0.3 m: along-corridor AMCL error displaces
+        door-frame returns through doorways into the next area's free
+        space (observed in main_corridor round 3), and anything real
+        beyond the boundary is re-checked when that area is inspected
+        from its own, closer viewpoint.
         Returns {'anomalies': [{x, y, cells, extent}], 'evidence_cells',
         'frames', 'truncated'}."""
         x0, y0, yaw = pose
@@ -193,6 +209,10 @@ class AreaClearChecker:
             cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
             if any(math.hypot(cx - px, cy - py) <= self.peer_radius_m
                    for px, py in peers):
+                continue
+            if bounds is not None and not (
+                    bounds[0] <= cx <= bounds[2]
+                    and bounds[1] <= cy <= bounds[3]):
                 continue
             anomalies.append({
                 'x': round(cx, 3), 'y': round(cy, 3), 'cells': len(cluster),

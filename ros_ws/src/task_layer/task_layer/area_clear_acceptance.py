@@ -17,7 +17,7 @@ from pathlib import Path
 import time
 
 import rclpy
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -99,6 +99,19 @@ class AreaClearAcceptance(Node):
                     peer, (msg.pose.pose.position.x, msg.pose.pose.position.y)),
                 latched)
         self._nav = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._cmd = self.create_publisher(Twist, 'cmd_vel', 10)
+
+    def relocalize_spin(self, duration_sec: float = 14.0, w: float = 0.5):
+        """AMCL only updates on motion (update_min_d/a): a robot that
+        arrives with an inflated covariance keeps it forever while parked.
+        One slow full turn at the stop feeds AMCL fresh geometry."""
+        msg = Twist()
+        msg.angular.z = w
+        end = time.time() + duration_sec
+        while time.time() < end:
+            self._cmd.publish(msg)
+            rclpy.spin_once(self, timeout_sec=0.05)
+        self._cmd.publish(Twist())
 
     def _on_scan(self, msg):
         if self._collecting:
@@ -108,6 +121,21 @@ class AreaClearAcceptance(Node):
         p = msg.pose.pose
         self._own_pose = (p.position.x, p.position.y, yaw_of(p.orientation),
                           list(msg.pose.covariance))
+
+    def area_bounds(self, key: str, margin: float = 0.30):
+        """Bounds of the inspected area shrunk by `margin`, for the
+        checker's out-of-area anomaly filter. Explicit stop labels map to
+        their area by progressively stripping _suffixes (east_hall_w ->
+        east_hall); unmatched labels get no bounds filter."""
+        areas = self.world_model['areas']
+        k = key
+        while k and k not in areas:
+            k = k.rsplit('_', 1)[0] if '_' in k else ''
+        bounds = areas.get(k, {}).get('bounds') if k else None
+        if not bounds:
+            return None
+        return (float(bounds['x_min']) + margin, float(bounds['y_min']) + margin,
+                float(bounds['x_max']) - margin, float(bounds['y_max']) - margin)
 
     def goto(self, x: float, y: float) -> str:
         if not self._nav.wait_for_server(timeout_sec=10.0):
@@ -166,37 +194,51 @@ class AreaClearAcceptance(Node):
                     self.get_logger().error(f'{area_key}: {nav}')
                     rows.append(f'{self.ns},{rnd},{area_key},{nav},,,,')
                     continue
-                settle_until = time.time() + settle
-                while time.time() < settle_until:
-                    rclpy.spin_once(self, timeout_sec=0.05)
-                scans = self.collect_scans(frames)
-                if len(scans) < frames or self._own_pose is None:
-                    rows.append(f'{self.ns},{rnd},{area_key},no_data,,,,')
-                    continue
-                x, y, yaw, cov = self._own_pose
-                std = round(math.sqrt(max(cov[0], cov[7], 0.0)), 3)
-                if pose_uncertain(cov, max_std):
-                    rows.append(f'{self.ns},{rnd},{area_key},skipped_uncertain_pose,,,{std},')
-                    continue
-                align = sum(self.checker.alignment_ratio(s, (x, y, yaw))
-                            for s in scans) / len(scans)
-                if align < float(self.get_parameter('min_alignment').value):
-                    self.get_logger().warn(
-                        f'{area_key}: scan-map alignment {align:.2f}, skipping')
-                    rows.append(f'{self.ns},{rnd},{area_key},skipped_misaligned,,,{std},{align:.2f}')
-                    continue
-                report = self.checker.check(scans, (x, y, yaw),
-                                            peers=list(self._peer_poses.values()))
-                report['alignment'] = round(align, 3)
-                stops += 1
-                n = len(report['anomalies'])
-                total_anomalies += n
-                line = {'ns': self.ns, 'round': rnd, 'area': area_key,
-                        'n_anomalies': n, **report}
-                print(json.dumps(line), flush=True)
-                payload = json.dumps(report['anomalies']).replace(',', ';')
-                rows.append(f"{self.ns},{rnd},{area_key},checked,{n},"
-                            f"{report['evidence_cells']},{std},{payload}")
+                min_align = float(self.get_parameter('min_alignment').value)
+                for attempt in (1, 2):
+                    settle_until = time.time() + settle
+                    while time.time() < settle_until:
+                        rclpy.spin_once(self, timeout_sec=0.05)
+                    scans = self.collect_scans(frames)
+                    if len(scans) < frames or self._own_pose is None:
+                        rows.append(f'{self.ns},{rnd},{area_key},no_data,,,,')
+                        break
+                    x, y, yaw, cov = self._own_pose
+                    std = round(math.sqrt(max(cov[0], cov[7], 0.0)), 3)
+                    uncertain = pose_uncertain(cov, max_std)
+                    align = 0.0 if uncertain else sum(
+                        self.checker.alignment_ratio(s, (x, y, yaw))
+                        for s in scans) / len(scans)
+                    if uncertain or align < min_align:
+                        if attempt == 1:
+                            self.get_logger().warn(
+                                f'{area_key}: pose_std={std} align={align:.2f}'
+                                ' — spinning in place to relocalize')
+                            self.relocalize_spin()
+                            continue
+                        if uncertain:
+                            rows.append(f'{self.ns},{rnd},{area_key},'
+                                        f'skipped_uncertain_pose,,,{std},')
+                        else:
+                            self.get_logger().warn(
+                                f'{area_key}: scan-map alignment {align:.2f}, skipping')
+                            rows.append(f'{self.ns},{rnd},{area_key},'
+                                        f'skipped_misaligned,,,{std},{align:.2f}')
+                        break
+                    report = self.checker.check(scans, (x, y, yaw),
+                                                peers=list(self._peer_poses.values()),
+                                                bounds=self.area_bounds(area_key))
+                    report['alignment'] = round(align, 3)
+                    stops += 1
+                    n = len(report['anomalies'])
+                    total_anomalies += n
+                    line = {'ns': self.ns, 'round': rnd, 'area': area_key,
+                            'n_anomalies': n, **report}
+                    print(json.dumps(line), flush=True)
+                    payload = json.dumps(report['anomalies']).replace(',', ';')
+                    rows.append(f"{self.ns},{rnd},{area_key},checked,{n},"
+                                f"{report['evidence_cells']},{std},{payload}")
+                    break
         Path(out_csv).write_text('\n'.join(rows) + '\n', encoding='utf-8')
         print(f'SUMMARY ns={self.ns} stops={stops} anomalies={total_anomalies} '
               f'csv={out_csv}', flush=True)
