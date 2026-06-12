@@ -2,6 +2,12 @@
 # and later the v0.4 action-based coordinator). Area keys reference
 # world_model.yaml; topic/action names are fully qualified because the
 # coordinator runs in the root namespace on the operator laptop.
+
+# East opening of the mother_base bay (between the wall_mother_base_north end
+# at x=-1.1 and the south end at x=-2.2). All home docks are behind it, so at
+# most one returning robot may thread it at a time.
+home_gate: {x: -1.65, y: -3.3, radius: 1.0}
+
 robots:
   tb3:
     display_name: "Robot B - TB3 Inspector"
