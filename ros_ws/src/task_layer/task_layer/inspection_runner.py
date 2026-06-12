@@ -140,6 +140,19 @@ class InspectionRunner(Node):
         raise ValueError(f"Unknown target area '{target}'. Known areas: {known}")
 
     def generate_candidate_poses(self, area: dict) -> list[dict]:
+        # Explicit viewpoints (world_model) override generation entirely:
+        # doorway-type areas (restricted_gate) are too narrow for the ring
+        # generator — bounds minus margin invert and every candidate dies —
+        # and their semantics is "stand HERE, face THERE", which a generated
+        # ring cannot express. The author's poses are trusted as-is.
+        viewpoints = area.get('viewpoints')
+        if viewpoints:
+            return [{
+                'label': f'viewpoint_{i}',
+                'x': round(float(vp['x']), 3),
+                'y': round(float(vp['y']), 3),
+                'yaw': round(float(vp.get('yaw', 0.0)), 4),
+            } for i, vp in enumerate(viewpoints, start=1)]
         center = area.get('center')
         if not center or len(center) < 2:
             raise ValueError('Selected area is missing center: [x, y]')
@@ -272,7 +285,10 @@ class InspectionRunner(Node):
         dry_run: bool,
     ) -> dict:
         candidates = self.generate_candidate_poses(area)
-        scan_yaws = [float(value) for value in self.get_parameter('scan_yaws').value]
+        # Per-area override: a doorway viewpoint photographs INTO the room
+        # (a few inward yaws) instead of the default 360-degree sweep.
+        scan_yaws = [float(value) for value in
+                     (area.get('scan_yaws') or self.get_parameter('scan_yaws').value)]
         area_dir = self.area_evidence_dir(sequence_index, area_key)
         result = {
             'sequence_index': sequence_index,
@@ -310,7 +326,8 @@ class InspectionRunner(Node):
                 'Trying %s candidate %s x=%.3f y=%.3f'
                 % (area_key, candidate['label'], candidate['x'], candidate['y'])
             )
-            goal = self.build_goal(candidate['x'], candidate['y'], 0.0)
+            goal = self.build_goal(candidate['x'], candidate['y'],
+                                   float(candidate.get('yaw', 0.0)))
             nav_result = self.send_goal_and_wait(goal)
             attempt = dict(candidate)
             attempt['result'] = nav_result

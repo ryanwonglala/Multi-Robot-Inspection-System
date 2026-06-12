@@ -123,6 +123,23 @@
         </geometry>
       </collision>
 
+      <!-- Peer-visibility collar: the CPU ray lidar intersects COLLISION
+           geometry, and the only collision at the 0.171 m scan-plane height
+           is the 5 cm LDS puck — robots were near-invisible to each other
+           (2-7 lidar returns at 1 m), so costmaps never inflated a peer and
+           they brushed/collided. This footprint-radius cylinder makes a peer
+           read as a full-width obstacle. Own lidar cannot see it: rays start
+           at range_min 0.12 m > 0.09 m surface. -->
+      <collision name="peer_visibility_collision">
+        <pose>-0.032 0 0.171 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.090</radius>
+            <length>0.060</length>
+          </cylinder>
+        </geometry>
+      </collision>
+
       <visual name="lidar_sensor_visual">
         <pose>-0.032 0 0.171 0 0 0</pose>
         <geometry>

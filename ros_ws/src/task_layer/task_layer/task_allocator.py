@@ -10,6 +10,7 @@ Exit codes: 0 = all robots finished OK, 2 = bad input, 5 = some robot failed.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import math
 from pathlib import Path
 import subprocess
@@ -194,12 +195,16 @@ class TaskAllocator(Node):
             self.get_logger().info(f'Allocation: {ns} -> {areas or "(idle)"}')
 
         use_sim_time = str(bool(self.get_parameter('use_sim_time').value)).lower()
-        report_root = Path(self.get_parameter('report_dir').value)
+        started_at = time.time()
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        # One directory per dispatch: every robot's run lands under it and
+        # the merged human-readable report sits on top.
+        mission_dir = Path(self.get_parameter('report_dir').value) / f'mission_{timestamp}'
         procs = {}
-        for ns, areas in plan.items():
-            if not areas:
-                continue
-            report_dir = report_root / ns
+        launch_order = [ns for ns, areas in plan.items() if areas]
+        for index, ns in enumerate(launch_order):
+            areas = plan[ns]
+            report_dir = mission_dir / ns
             report_dir.mkdir(parents=True, exist_ok=True)
             # Runners never return home on their own: the allocator owns the
             # end-of-mission return so it can arbitrate the shared doorway
@@ -217,6 +222,12 @@ class TaskAllocator(Node):
             procs[ns] = (subprocess.Popen(
                 command, stdout=log_file, stderr=subprocess.STDOUT, text=True), log_file)
             self.get_logger().info(f'{ns}: inspecting {areas}')
+            # Staggered departure: outbound robots share the single
+            # mother_base doorway just like returning ones, and simultaneous
+            # launches brushed/collided around the docks. Hold the next
+            # launch until this robot has threaded the gate outbound.
+            if index < len(launch_order) - 1:
+                self.wait_departed(ns)
 
         codes = {}
         for ns, (process, log_file) in procs.items():
@@ -224,12 +235,139 @@ class TaskAllocator(Node):
             log_file.close()
             self.get_logger().info(f'{ns}: finished with code {codes[ns]}')
 
+        return_results: dict[str, bool] = {}
         if bool(self.get_parameter('return_home').value):
-            results = self.return_all_home(list(procs))
-            for ns, ok in results.items():
+            return_results = self.return_all_home(list(procs))
+            for ns, ok in return_results.items():
                 if not ok:
                     codes[ns] = codes.get(ns) or 6
+
+        report_path = self.write_mission_report(
+            mission_dir, route, plan, codes, return_results, started_at)
+        self.get_logger().info(f'Mission report written: {report_path}')
         return 0 if all(code == 0 for code in codes.values()) else 5
+
+    def wait_departed(self, ns: str, timeout_sec: float = 90.0):
+        """Block until `ns` has passed the mother_base gate outbound (farther
+        from its dock than the gate is, and outside the gate zone), or until
+        timeout. Robots already away from their dock pass instantly."""
+        gate_x = float(self.home_gate.get('x', -1.65))
+        gate_y = float(self.home_gate.get('y', -3.3))
+        gate_radius = float(self.home_gate.get('radius', 1.0))
+        home = self.robots[ns].get('home_pose') or {}
+        if not {'x', 'y'} <= home.keys():
+            time.sleep(10.0)  # no dock to measure from: fixed stagger
+            return
+        hx, hy = float(home['x']), float(home['y'])
+        gate_to_home = math.hypot(gate_x - hx, gate_y - hy)
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            pose = self.robot_poses.get(ns)
+            if pose is None:
+                continue
+            gate_dist = math.hypot(pose[0] - gate_x, pose[1] - gate_y)
+            home_dist = math.hypot(pose[0] - hx, pose[1] - hy)
+            if gate_dist > gate_radius and home_dist > gate_to_home:
+                self.get_logger().info(f'{ns}: cleared the dock gate')
+                return
+        self.get_logger().warn(
+            f'{ns}: departure not confirmed after {timeout_sec:.0f}s, '
+            'launching the next robot anyway')
+
+    MISSION_REPORT_GUIDE = """\
+# ==========================================================================
+# RoboInspect 联合巡检报告（task_allocator 在全部机器人结束后自动汇总）
+#
+# 怎么读：
+#   mission.status   整体结论：completed = 全部区域完成且全部回桩；
+#                    completed_with_failures = 有失败项，到 robots 段找原因
+#   allocation       本次路线如何拆给各机器人（按真实路径代价就近分配）
+#   robots.<机器人>.areas   每个被巡检区域一条：
+#       status: checked    = 已到点完成 360° 环拍取证
+#               nav_failed = 尝试了多个候选点仍到不了（路径被堵或区域被占）
+#               unchecked  = 区域边界内找不到可用观测点
+#       photos             = 该区域拍到的照片张数
+#       evidence_dir       = 照片与导航细节所在目录
+#   robots.<机器人>.checked  完成数/分配数
+#   return_home      succeeded = 已回到自己的充电桩
+#   detail_report    该机器人的完整机读报告路径（本文件是给人看的汇总）
+#
+# 注：v0.3 报告记录"执行与取证"；激光/视觉异常判读将在 P1-5 接入后出现在
+#     anomalies 字段中。
+# ==========================================================================
+"""
+
+    def write_mission_report(self, mission_dir: Path, route: list[str],
+                             plan: dict[str, list[str]], codes: dict[str, int],
+                             return_results: dict[str, bool],
+                             started_at: float) -> Path:
+        """Merge every runner's report.yaml into one annotated, human-first
+        file at the top of the mission directory."""
+        return_enabled = bool(self.get_parameter('return_home').value)
+        robots: dict[str, dict] = {}
+        for ns, areas in plan.items():
+            if not areas:
+                robots[ns] = {'status': 'idle', 'allocated_areas': []}
+                continue
+            # Copy: the same list object reused in mission.allocation would
+            # make yaml emit &id/*id anchors in the human-facing file.
+            entry: dict = {'allocated_areas': list(areas)}
+            runner_report = self._latest_runner_report(mission_dir / ns)
+            if runner_report is None:
+                entry['status'] = 'no_report'
+            else:
+                data, report_file = runner_report
+                summary = data.get('summary') or {}
+                entry['status'] = data.get('status')
+                entry['checked'] = (f"{summary.get('checked_count', 0)}"
+                                    f"/{summary.get('requested_count', len(areas))}")
+                entry['areas'] = [{
+                    'area': a.get('area'),
+                    'display_name': a.get('display_name'),
+                    'status': a.get('status'),
+                    'photos': a.get('captured_image_count', 0),
+                    'evidence_dir': a.get('evidence_dir'),
+                    **({'reason': a['reason']} if a.get('reason') else {}),
+                } for a in data.get('areas', [])]
+                entry['detail_report'] = str(report_file)
+            if not return_enabled:
+                entry['return_home'] = 'disabled'
+            elif ns in return_results:
+                entry['return_home'] = ('succeeded' if return_results[ns]
+                                        else 'failed')
+            else:
+                entry['return_home'] = 'skipped'
+            entry['exit_code'] = codes.get(ns)
+            robots[ns] = entry
+
+        all_ok = (all(code == 0 for code in codes.values())
+                  and (not return_enabled or all(return_results.values())))
+        mission = {
+            'mission': {
+                'generated_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'duration_sec': round(time.time() - started_at, 1),
+                'route_requested': route,
+                'allocation': {ns: list(areas) for ns, areas in plan.items()},
+                'status': 'completed' if all_ok else 'completed_with_failures',
+            },
+            'robots': robots,
+        }
+        mission_dir.mkdir(parents=True, exist_ok=True)
+        path = mission_dir / 'report.yaml'
+        with path.open('w', encoding='utf-8') as f:
+            f.write(self.MISSION_REPORT_GUIDE)
+            yaml.safe_dump(mission, f, sort_keys=False, allow_unicode=True)
+        return path
+
+    def _latest_runner_report(self, ns_dir: Path) -> tuple[dict, Path] | None:
+        runs = sorted(d for d in ns_dir.glob('inspection_*') if d.is_dir())
+        for run_dir in reversed(runs):
+            report_file = run_dir / 'report.yaml'
+            if report_file.exists():
+                with report_file.open(encoding='utf-8') as f:
+                    return yaml.safe_load(f) or {}, report_file
+        return None
 
     def _home_goal(self, ns: str) -> NavigateToPose.Goal:
         home = self.robots[ns]['home_pose']
