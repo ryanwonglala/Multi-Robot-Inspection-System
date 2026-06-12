@@ -132,7 +132,8 @@ def build_summary_text(mission: dict) -> str:
 
     issues = []
     skip_cn = {'skipped_uncertain_pose': '定位不稳',
-               'skipped_misaligned': '扫描与地图对不齐'}
+               'skipped_misaligned': '扫描与地图对不齐',
+               'no_baseline': '该点位无基准照片（先跑一次基准巡逻）'}
     for ns, entry in robots.items():
         if entry.get('status') == 'no_report':
             issues.append(f'{ns}: 未产出报告（进程异常，看 allocator_run.log）')
@@ -142,7 +143,7 @@ def build_summary_text(mission: dict) -> str:
                 issues.append('%s/%s: 区域未完成（%s）'
                               % (ns, name, area.get('status')))
             clear_status = area.get('area_clear_status') or ''
-            if clear_status.startswith('skipped'):
+            if clear_status.startswith('skipped') or clear_status == 'no_baseline':
                 issues.append('%s/%s: 到点异常检测跳过（%s）——只有环拍照片，'
                               '该区异常可能漏检' % (ns, name,
                               skip_cn.get(clear_status, clear_status)))
@@ -165,6 +166,9 @@ class TaskAllocator(Node):
         self.declare_parameter('report_dir', default_report_dir())
         self.declare_parameter('pose_wait_sec', 5.0)
         self.declare_parameter('return_home', True)
+        # Passed through to every runner: true turns this dispatch into a
+        # baseline patrol (clean scene -> record reference photos, no diff).
+        self.declare_parameter('baseline_record', False)
         try:
             self.declare_parameter('use_sim_time', True)
         except rclpy.exceptions.ParameterAlreadyDeclaredException:
@@ -337,6 +341,8 @@ class TaskAllocator(Node):
                 '-p', f"route:={','.join(areas)}",
                 '-p', 'return_home:=false',
                 '-p', f'report_dir:={report_dir}',
+                '-p', ('baseline_record:='
+                       + str(bool(self.get_parameter('baseline_record').value)).lower()),
             ]
             log_file = open(report_dir / 'allocator_run.log', 'w', encoding='utf-8')
             procs[ns] = (subprocess.Popen(
@@ -416,15 +422,17 @@ class TaskAllocator(Node):
 #   return_home      succeeded = 已回到自己的充电桩
 #   detail_report    该机器人的完整机读报告路径（本文件是给人看的汇总）
 #
-#   mission.anomaly_count  本次任务发现的异常总数（激光-地图差分检出）
+#   mission.anomaly_count  本次任务发现的异常总数（照片-基准比对检出：
+#       巡检照片与"干净场景基准照"逐点位差分，变化区域经地面交汇法定位）
 #   anomalies        异常清单，每条含：发现机器人/区域/map 坐标/尺寸/取证照
 #       type=center_relocated_prior 表示"巡检点被占被迫改址"——它不是确认的
 #       异常物体，而是一条先验线索（有东西占着该去的位置）
 #   robots.<机器人>.areas[].area_clear_status  到点检测结果：
-#       checked=已检 / skipped_uncertain_pose=定位不稳跳过 /
-#       skipped_misaligned=扫描与地图对不齐跳过（均为诚实弃权，非故障）
+#       checked=已比对 / no_baseline=该点位无基准照片（需先跑基准巡逻：
+#       场景干净时 -p baseline_record:=true 派一次同路线任务）/
+#       baseline_recorded=本次为基准巡逻 / skipped_*=旧激光路线弃权态
 #
-# 注：异常坐标在 map 系，误差地板≈AMCL 定位误差（实测 0.1~0.3m）。
+# 注：异常坐标在 map 系，误差≈AMCL 定位误差 + 投影误差（受控实测 <0.15m）。
 # ==========================================================================
 """
 

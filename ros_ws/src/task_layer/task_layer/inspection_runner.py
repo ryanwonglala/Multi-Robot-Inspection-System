@@ -5,24 +5,30 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import shutil
 import time
 
 import rclpy
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import Image, LaserScan
+from sensor_msgs.msg import CameraInfo, Image, LaserScan
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 import yaml
 
 from task_layer.anomaly_scanner import AnomalyScanner
 from task_layer.area_clear_check import merge_detections
+from task_layer.photo_diff_check import (
+    CameraModel,
+    detect_changes,
+    merge_photo_detections,
+)
 from task_layer.report_writer import default_report_dir, write_report
 from task_layer.scan_analyzer import aggregate_scan_summaries, summarize_scan
 
@@ -77,7 +83,28 @@ class InspectionRunner(Node):
         # candidates is cheap — blocked ones are skipped without driving.
         self.declare_parameter('max_candidate_attempts_per_area', 4)
         # --- P1-5: anomaly detection + candidate costmap prechecking ---
-        self.declare_parameter('detect_anomalies', True)
+        # Laser map-diff detection is retired (its test regime — large
+        # unmapped obstacles — corrupts AMCL, see MASTER_PLAN C5 pivot).
+        # Kept behind this flag as an experiment; photo diff is the default.
+        self.declare_parameter('detect_anomalies', False)
+        # Photo-diff anomaly detection (P1-5v): compare each inspection
+        # photo against the baseline photo recorded from the same stop/yaw
+        # when the scene was clean. baseline_record:=true turns a run into
+        # the baseline patrol that produces that library.
+        self.declare_parameter('detect_photo_diff', True)
+        self.declare_parameter('baseline_record', False)
+        self.declare_parameter('baseline_dir', str(
+            Path.home() / 'roboinspec_ws' / 'baselines'))
+        self.declare_parameter('photo_diff_threshold', 35)
+        self.declare_parameter('photo_diff_tolerance_px', 7)
+        self.declare_parameter('photo_diff_min_area_px', 400)
+        self.declare_parameter('photo_diff_max_range', 4.0)
+        # Camera mount in the base frame; keep in sync with the camera link
+        # pose in sim/models/turtlebot3_burger_cam_ns/model.sdf (and with
+        # the real robot's measured mount before field runs).
+        self.declare_parameter('camera_mount_x', 0.076)
+        self.declare_parameter('camera_mount_z', 0.250)
+        self.declare_parameter('camera_info_topic', 'camera/camera_info')
         self.declare_parameter('map_yaml', str(
             Path(get_package_share_directory('task_layer')) / 'maps' / 'tb3_map.yaml'))
         self.declare_parameter('robots_yaml', str(
@@ -117,10 +144,21 @@ class InspectionRunner(Node):
         image_topic = self.get_parameter('image_topic').value
         self.create_subscription(LaserScan, scan_topic, self._scan_callback, 10)
         self.create_subscription(Image, image_topic, self._image_callback, 10)
+        self._camera_info = None
+        self.create_subscription(
+            CameraInfo, self.get_parameter('camera_info_topic').value,
+            self._camera_info_callback, 10)
 
         self.robot_name = self.get_namespace().strip('/') or 'robot'
         self._cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self._anomaly_seq = 0
+        # Own belief pose, independent of any detector: photo localization
+        # and the post-failure displacement check both need it.
+        self._own_pose = None  # (x, y, yaw)
+        amcl_qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE,
+                              durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose',
+                                 self._on_amcl_pose, amcl_qos)
         self.scanner = None
         if bool(self.get_parameter('detect_anomalies').value):
             self.scanner = AnomalyScanner(
@@ -145,11 +183,105 @@ class InspectionRunner(Node):
             self.create_subscription(OccupancyGrid, 'global_costmap/costmap',
                                      self._costmap_callback, costmap_qos)
 
+    def _on_amcl_pose(self, msg: PoseWithCovarianceStamped):
+        p = msg.pose.pose
+        q = p.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self._own_pose = (p.position.x, p.position.y, yaw)
+
     def _scan_callback(self, msg: LaserScan):
         self._latest_scan = msg
 
     def _image_callback(self, msg: Image):
         self._latest_image = msg
+
+    def _camera_info_callback(self, msg: CameraInfo):
+        self._camera_info = msg
+
+    def camera_model(self) -> CameraModel:
+        """Intrinsics from the live camera_info when available (so a real
+        camera swap needs no code change); mount pose always from params."""
+        mount_x = float(self.get_parameter('camera_mount_x').value)
+        mount_z = float(self.get_parameter('camera_mount_z').value)
+        info = self._camera_info
+        if info is None:
+            return CameraModel(mount_x=mount_x, mount_z=mount_z)
+        return CameraModel(
+            fx=float(info.k[0]), fy=float(info.k[4]),
+            cx=float(info.k[2]), cy=float(info.k[5]),
+            width=int(info.width), height=int(info.height),
+            mount_x=mount_x, mount_z=mount_z)
+
+    def baseline_photo_path(self, area_key: str, stop_label: str,
+                            yaw_index: int) -> Path:
+        """Baseline library key. Shared across robots: both carry the same
+        camera at the same mount (per-robot libraries become necessary only
+        if the real mounts diverge)."""
+        return (Path(str(self.get_parameter('baseline_dir').value)).expanduser()
+                / safe_path_name(area_key) / safe_path_name(stop_label)
+                / f'yaw{yaw_index:02d}.ppm')
+
+    def photo_diff_stop(self, area_key: str, area: dict, stop: dict,
+                        stop_samples: list[tuple[int, dict]]) -> dict:
+        """Per-stop photo handling: in baseline_record mode archive the
+        photos as the clean reference; otherwise diff each photo against
+        its baseline and return map-frame anomaly candidates."""
+        record = bool(self.get_parameter('baseline_record').value)
+        stop_label = str(stop.get('label', 'stop'))
+        outcome = {'stop': {'label': stop_label, 'x': stop['x'], 'y': stop['y']},
+                   'anomalies': []}
+        if record:
+            recorded = 0
+            for yaw_index, sample in stop_samples:
+                photo = (sample.get('image_capture') or {}).get('image_path')
+                if not photo:
+                    continue
+                target = self.baseline_photo_path(area_key, stop_label, yaw_index)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(photo, target)
+                recorded += 1
+            outcome.update({'status': 'baseline_recorded', 'photos': recorded})
+            self.get_logger().info(
+                '%s/%s: %d baseline photo(s) recorded'
+                % (area_key, stop_label, recorded))
+            return outcome
+
+        camera = self.camera_model()
+        bounds = self.detect_bounds(area)
+        clip = bool(area.get('photo_detect_clip_bounds', True))
+        checked = 0
+        found: list[dict] = []
+        for yaw_index, sample in stop_samples:
+            photo = (sample.get('image_capture') or {}).get('image_path')
+            base = self.baseline_photo_path(area_key, stop_label, yaw_index)
+            if not photo or not base.exists():
+                continue
+            pose = sample.get('pose_at_capture') or (
+                stop['x'], stop['y'], float(sample.get('yaw', 0.0)))
+            detection = detect_changes(
+                base, photo, pose, camera,
+                threshold=int(self.get_parameter('photo_diff_threshold').value),
+                tolerance_px=int(self.get_parameter('photo_diff_tolerance_px').value),
+                min_area_px=int(self.get_parameter('photo_diff_min_area_px').value),
+                max_range=float(self.get_parameter('photo_diff_max_range').value))
+            checked += 1
+            for anomaly in detection['anomalies']:
+                # Bounds clip keeps doorway-leaked sightings of NEIGHBOR
+                # rooms out; gate areas that exist to photograph INTO a
+                # room opt out via photo_detect_clip_bounds: false.
+                if (clip and bounds is not None
+                        and not (bounds[0] <= anomaly['x'] <= bounds[2]
+                                 and bounds[1] <= anomaly['y'] <= bounds[3])):
+                    continue
+                anomaly['detected_from'] = {
+                    'stop': stop_label, 'yaw_index': yaw_index,
+                    'photo': photo}
+                found.append(anomaly)
+        outcome['status'] = 'checked' if checked else 'no_baseline'
+        outcome['anomalies'] = merge_photo_detections([], found)
+        outcome['photos_checked'] = checked
+        return outcome
 
     def _costmap_callback(self, msg: OccupancyGrid):
         self._costmap = msg
@@ -525,7 +657,7 @@ class InspectionRunner(Node):
                 'Trying %s candidate %s x=%.3f y=%.3f'
                 % (area_key, candidate['label'], candidate['x'], candidate['y']))
             nav_tries += 1
-            pose_before = self.scanner._own_pose if self.scanner else None
+            pose_before = self._own_pose
             nav_result = self.send_goal_and_wait(
                 self.build_goal(candidate['x'], candidate['y'],
                                 float(candidate.get('yaw', 0.0))),
@@ -551,7 +683,7 @@ class InspectionRunner(Node):
             # wedged near the blocked goal. An instant planning failure
             # moves nothing — blind reversing then just walks the robot
             # backwards (observed: four reverses marched it into a doorway).
-            pose_after = self.scanner._own_pose if self.scanner else None
+            pose_after = self._own_pose
             if (pose_before is not None and pose_after is not None
                     and math.hypot(pose_after[0] - pose_before[0],
                                    pose_after[1] - pose_before[1]) > 0.3):
@@ -559,19 +691,29 @@ class InspectionRunner(Node):
             return False
 
         detections = []
+        photo_checks = []
+        photo_diff_on = (bool(self.get_parameter('detect_photo_diff').value)
+                         and not dry_run)
         sample_index = 0
 
         def inspect_stop(stop):
             nonlocal sample_index
-            for yaw in scan_yaws:
+            stop_samples = []
+            for yaw_index, yaw in enumerate(scan_yaws):
                 sample_index += 1
                 self.get_logger().info('Inspecting %s yaw=%.4f' % (area_key, yaw))
-                result['scan_samples'].append(self.collect_scan_sample(
-                    stop['x'], stop['y'], yaw, area_key, area_dir, sample_index))
+                sample = self.collect_scan_sample(
+                    stop['x'], stop['y'], yaw, area_key, area_dir, sample_index)
+                sample['pose_at_capture'] = self._own_pose
+                result['scan_samples'].append(sample)
+                stop_samples.append((yaw_index, sample))
             if self.scanner is not None and not dry_run:
                 detection = self.scanner.detect_here(bounds=self.detect_bounds(area))
                 detection['stop'] = {'x': stop['x'], 'y': stop['y']}
                 detections.append(detection)
+            if photo_diff_on:
+                photo_checks.append(
+                    self.photo_diff_stop(area_key, area, stop, stop_samples))
 
         stops_visited = []
         # Areas longer than the lidar diameter (east_hall) declare
@@ -627,7 +769,7 @@ class InspectionRunner(Node):
                    result['center_relocated']['reason'], stops_visited[0]['label']))
 
         area_clear = {'status': 'disabled', 'anomalies': []}
-        if detections:
+        if detections:  # laser route, experimental (detect_anomalies:=true)
             merged = []
             for detection in detections:
                 merged = merge_detections(merged, detection['anomalies'])
@@ -637,8 +779,26 @@ class InspectionRunner(Node):
                 'anomalies': merged,
                 'stops': detections,
             }
+        if photo_checks:  # photo-diff route (P1-5v default)
+            merged_photo = []
+            for check in photo_checks:
+                merged_photo = merge_photo_detections(
+                    merged_photo, check['anomalies'])
+            photo_checked = [c for c in photo_checks
+                             if c['status'] == 'checked']
+            photo_status = ('checked' if photo_checked
+                            else photo_checks[0]['status'])
+            if area_clear['status'] == 'disabled':
+                area_clear = {'status': photo_status,
+                              'anomalies': merged_photo,
+                              'stops': photo_checks}
+            else:  # both detectors on: photo findings join the list as-is
+                area_clear['anomalies'] = (
+                    area_clear['anomalies'] + merged_photo)
+                area_clear['photo_status'] = photo_status
+        if area_clear['anomalies']:
             final_stop = stops_visited[-1]
-            for index, anomaly in enumerate(merged, start=1):
+            for index, anomaly in enumerate(area_clear['anomalies'], start=1):
                 capture = self.capture_anomaly_evidence(
                     final_stop, anomaly, area_dir, index)
                 anomaly['evidence_photo'] = capture.get('image_path')

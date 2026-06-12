@@ -277,6 +277,9 @@ areas:
     - 2.3562
     - 1.5708
     - 0.7854
+    # 照片差分不裁剪到本区 bounds：这个门口点位的职责就是"向禁入房
+    # 内看"，检出的异常坐标天然落在邻区（restricted_zone）里。
+    photo_detect_clip_bounds: false
     color_rgba:
     - 0.949999988
     - 0.340000004
