@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import tkinter as tk
@@ -348,6 +349,11 @@ class TaskGui:
         report = ttk.LabelFrame(right, text='Inspection Status')
         report.pack(fill='both', expand=True, pady=(10, 0))
         ttk.Label(report, textvariable=self.inspect_status_var).pack(anchor='w', padx=6, pady=(6, 0))
+        # Live allocation plan, filled from the allocator log as soon as the
+        # route split is decided (well before any robot finishes).
+        self.allocation_var = tk.StringVar(value='')
+        ttk.Label(report, textvariable=self.allocation_var, justify='left',
+                  wraplength=420).pack(anchor='w', padx=6, pady=(4, 0))
         ttk.Label(report, textvariable=self.latest_report_var, wraplength=420).pack(anchor='w', padx=6, pady=(4, 6))
         # Red anomaly line(s); plain tk.Label because ttk has no fg option.
         self.anomaly_var = tk.StringVar(value='')
@@ -533,13 +539,20 @@ class TaskGui:
         ]
         try:
             log_file = open(log_path, 'w', encoding='utf-8')
+            # Unbuffered child stdout: the GUI tails this log for the
+            # "Allocation:" lines while the mission is still running, and a
+            # block-buffered pipe would hold them back until exit.
+            env = {**os.environ, 'PYTHONUNBUFFERED': '1',
+                   'RCUTILS_LOGGING_BUFFERED_STREAM': '0'}
             self.inspect_processes['__auto__'] = subprocess.Popen(
-                command, stdout=log_file, stderr=subprocess.STDOUT, text=True)
+                command, stdout=log_file, stderr=subprocess.STDOUT, text=True,
+                env=env)
             self.inspect_logs['__auto__'] = (log_file, log_path)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror('Inspection Error', str(exc))
             return
         self.inspect_status_var.set('[auto] allocating route across robots')
+        self.allocation_var.set('')
         self.latest_report_var.set('')
 
     def start_manual_inspection(self, route: str):
@@ -584,6 +597,7 @@ class TaskGui:
             messagebox.showerror('Inspection Error', str(exc))
             return
         self.inspect_status_var.set(f'[{label}] inspection running')
+        self.allocation_var.set(f'Allocation:\n{label} -> {route}')
         self.latest_report_var.set('')
 
     def poll_inspection(self):
@@ -603,6 +617,8 @@ class TaskGui:
                 continue
             return_code = process.poll()
             if return_code is None:
+                if ns == '__auto__':
+                    self.update_allocation_display()
                 continue
             log_file, log_path = self.inspect_logs.pop(ns, (None, None))
             if log_file:
@@ -628,7 +644,25 @@ class TaskGui:
             self.inspect_processes[ns] = None
         self.root.after(500, self.poll_inspection)
 
-    def extract_report_line(self, output: str) -> str:
+    def update_allocation_display(self):
+        """Tail the running allocator's log and surface the route split the
+        moment it is logged (one 'Allocation: ns -> [...]' line per robot)."""
+        entry = self.inspect_logs.get('__auto__')
+        if not entry:
+            return
+        _file, log_path = entry
+        try:
+            text = log_path.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return
+        plan = []
+        for line in text.splitlines():
+            if 'Allocation:' in line:
+                part = line.split('Allocation:', 1)[1].strip()
+                plan.append(part.replace("['", '').replace("']", '')
+                                .replace("', '", ', '))
+        if plan:
+            self.allocation_var.set('Allocation:\n' + '\n'.join(plan))
         for line in output.splitlines():
             if 'Inspection report written:' in line:
                 return line.split('Inspection report written:', 1)[1].strip()

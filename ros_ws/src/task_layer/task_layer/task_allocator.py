@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import math
 from pathlib import Path
+import shutil
 import subprocess
 import time
 
@@ -34,6 +35,125 @@ from task_layer.report_writer import default_report_dir
 def default_share(name: str) -> str:
     from ament_index_python.packages import get_package_share_directory
     return str(Path(get_package_share_directory('task_layer')) / 'config' / name)
+
+
+def export_anomaly_evidence(mission_dir: Path, anomalies: list[dict]) -> None:
+    """Gather every anomaly's evidence photo into mission_dir/anomaly_evidence/
+    (converted to PNG when PIL is available, raw copy otherwise) and point the
+    anomaly entry at the copy. The original stays in the per-robot run dir."""
+    with_photo = [a for a in anomalies if a.get('evidence_photo')]
+    if not with_photo:
+        return
+    out_dir = mission_dir / 'anomaly_evidence'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for index, anomaly in enumerate(with_photo, start=1):
+        src = Path(anomaly['evidence_photo'])
+        if not src.exists():
+            continue
+        stem = f"{index:02d}_{anomaly.get('robot', 'robot')}_{anomaly.get('area', 'area')}"
+        try:
+            from PIL import Image as PILImage
+            dst = out_dir / f'{stem}.png'
+            PILImage.open(src).save(dst)
+        except Exception:  # noqa: BLE001  (no PIL / odd encoding: keep raw)
+            dst = out_dir / (stem + src.suffix)
+            try:
+                shutil.copy2(src, dst)
+            except OSError:
+                continue
+        anomaly['evidence_photo'] = str(dst)
+
+
+def build_summary_text(mission: dict) -> str:
+    """One-screen plain-language digest written next to report.yaml: the
+    operator reads this first and only opens the yaml for forensics."""
+    info = mission.get('mission', {})
+    robots = mission.get('robots', {})
+    anomalies = mission.get('anomalies', [])
+    confirmed = [a for a in anomalies if a.get('type') != 'center_relocated_prior']
+    priors = [a for a in anomalies if a.get('type') == 'center_relocated_prior']
+    status_cn = {
+        'completed': '全部完成',
+        'completed_with_failures': '有失败项（细节见 report.yaml）',
+    }
+    return_cn = {'succeeded': '已回桩', 'failed': '回桩失败',
+                 'skipped': '未回桩', 'disabled': '未启用回桩'}
+
+    lines = ['RoboInspect 巡检速览', '=' * 46]
+    lines.append('时间: %s    用时: %ss' % (info.get('generated_at', '?'),
+                                          info.get('duration_sec', '?')))
+    lines.append('结论: %s    异常: %d 处' % (
+        status_cn.get(info.get('status'), str(info.get('status'))),
+        len(confirmed)))
+    lines.append('')
+    lines.append('—— 路线分配与完成情况 ——')
+    for ns, entry in robots.items():
+        areas = entry.get('allocated_areas') or []
+        if not areas:
+            lines.append(f'{ns}: （本次未分配任务）')
+            continue
+        lines.append('%s: %s ｜ 完成 %s ｜ %s' % (
+            ns, ', '.join(areas), entry.get('checked', '?'),
+            return_cn.get(entry.get('return_home'),
+                          str(entry.get('return_home')))))
+
+    lines.append('')
+    lines.append('—— 异常清单 ——')
+    if not confirmed:
+        lines.append('未发现异常。')
+    used_priors: set[int] = set()
+    for index, anomaly in enumerate(confirmed, start=1):
+        lines.append('%d. %s (%.2f, %.2f)  尺寸≈%.2fm    发现者: %s' % (
+            index, anomaly.get('area', '?'),
+            float(anomaly.get('x', 0.0)), float(anomaly.get('y', 0.0)),
+            float(anomaly.get('extent') or 0.0), anomaly.get('robot', '?')))
+        if anomaly.get('evidence_photo'):
+            lines.append('   照片: %s' % anomaly['evidence_photo'])
+        for j, prior in enumerate(priors):
+            if (j in used_priors or prior.get('robot') != anomaly.get('robot')
+                    or prior.get('area') != anomaly.get('area')):
+                continue
+            src = prior.get('from') or {}
+            lines.append('   线索: 原定巡检点 %s(%.2f, %.2f) 被占，改在 %s 完成检测'
+                         % (src.get('label', '?'), float(src.get('x', 0.0)),
+                            float(src.get('y', 0.0)), prior.get('to', '?')))
+            used_priors.add(j)
+    leftover = [p for j, p in enumerate(priors) if j not in used_priors]
+    if leftover:
+        lines.append('')
+        lines.append('—— 待核实线索（巡检点被占但未确认异常物体，建议人工查看）——')
+        for prior in leftover:
+            src = prior.get('from') or {}
+            lines.append('%s/%s: 点位 %s(%.2f, %.2f) 被占（%s），改址 %s' % (
+                prior.get('robot', '?'), prior.get('area', '?'),
+                src.get('label', '?'), float(src.get('x', 0.0)),
+                float(src.get('y', 0.0)), prior.get('reason', '?'),
+                prior.get('to', '?')))
+
+    issues = []
+    skip_cn = {'skipped_uncertain_pose': '定位不稳',
+               'skipped_misaligned': '扫描与地图对不齐'}
+    for ns, entry in robots.items():
+        if entry.get('status') == 'no_report':
+            issues.append(f'{ns}: 未产出报告（进程异常，看 allocator_run.log）')
+        for area in entry.get('areas') or []:
+            name = area.get('area', '?')
+            if area.get('status') != 'checked':
+                issues.append('%s/%s: 区域未完成（%s）'
+                              % (ns, name, area.get('status')))
+            clear_status = area.get('area_clear_status') or ''
+            if clear_status.startswith('skipped'):
+                issues.append('%s/%s: 到点异常检测跳过（%s）——只有环拍照片，'
+                              '该区异常可能漏检' % (ns, name,
+                              skip_cn.get(clear_status, clear_status)))
+        if entry.get('return_home') == 'failed':
+            issues.append(f'{ns}: 回桩失败')
+    lines.append('')
+    lines.append('—— 需要注意 ——')
+    lines.extend(issues or ['无'])
+    lines.append('')
+    lines.append('完整细节: report.yaml    异常照片: anomaly_evidence/')
+    return '\n'.join(lines) + '\n'
 
 
 class TaskAllocator(Node):
@@ -279,6 +399,9 @@ class TaskAllocator(Node):
 # ==========================================================================
 # RoboInspect 联合巡检报告（task_allocator 在全部机器人结束后自动汇总）
 #
+# 想快速看结论：读同目录 SUMMARY.txt（一屏速览）；本文件是完整记录。
+# 异常取证照已集中拷贝到同目录 anomaly_evidence/，按"序号_机器人_区域"命名。
+#
 # 怎么读：
 #   mission.status   整体结论：completed = 全部区域完成且全部回桩；
 #                    completed_with_failures = 有失败项，到 robots 段找原因
@@ -355,6 +478,7 @@ class TaskAllocator(Node):
 
         all_ok = (all(code == 0 for code in codes.values())
                   and (not return_enabled or all(return_results.values())))
+        export_anomaly_evidence(mission_dir, mission_anomalies)
         confirmed = [a for a in mission_anomalies
                      if a.get('type') != 'center_relocated_prior']
         mission = {
@@ -374,6 +498,8 @@ class TaskAllocator(Node):
         with path.open('w', encoding='utf-8') as f:
             f.write(self.MISSION_REPORT_GUIDE)
             yaml.safe_dump(mission, f, sort_keys=False, allow_unicode=True)
+        (mission_dir / 'SUMMARY.txt').write_text(
+            build_summary_text(mission), encoding='utf-8')
         return path
 
     def _latest_runner_report(self, ns_dir: Path) -> tuple[dict, Path] | None:

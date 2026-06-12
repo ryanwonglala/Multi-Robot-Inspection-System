@@ -243,7 +243,10 @@ class InspectionRunner(Node):
         label.pose.position.y = float(anomaly['y'])
         label.pose.position.z = 0.75
         label.scale.z = 0.22
-        label.color.r = label.color.g = label.color.b = label.color.a = 1.0
+        # Red text: the map's free space renders white in RViz, so a white
+        # label is invisible against it.
+        label.color.r, label.color.g, label.color.b = 0.8, 0.0, 0.0
+        label.color.a = 1.0
         label.text = f"{area_key} ({anomaly['x']:.2f}, {anomaly['y']:.2f})"
         self._marker_pub.publish(MarkerArray(markers=[body, label]))
         self.get_logger().warn(
