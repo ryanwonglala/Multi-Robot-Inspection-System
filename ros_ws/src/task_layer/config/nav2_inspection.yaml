@@ -232,7 +232,13 @@ local_costmap:
         mark_threshold: 0
         observation_sources: scan
         scan:
-          topic: scan
+          # MUST be the robot's absolute scan topic. A relative 'scan'
+          # resolves inside the costmap node's own sub-namespace
+          # (/<ns>/global_costmap/scan) — a dead letter box: both costmaps
+          # were scan-deaf since namespace-ization and obstacles never
+          # entered them. <robot_namespace> is substituted by
+          # nav2_bringup's ReplaceString when use_namespace is true.
+          topic: <robot_namespace>/scan
           max_obstacle_height: 2.0
           clearing: true
           marking: true
@@ -271,7 +277,13 @@ global_costmap:
         enabled: true
         observation_sources: scan
         scan:
-          topic: scan
+          # MUST be the robot's absolute scan topic. A relative 'scan'
+          # resolves inside the costmap node's own sub-namespace
+          # (/<ns>/global_costmap/scan) — a dead letter box: both costmaps
+          # were scan-deaf since namespace-ization and obstacles never
+          # entered them. <robot_namespace> is substituted by
+          # nav2_bringup's ReplaceString when use_namespace is true.
+          topic: <robot_namespace>/scan
           max_obstacle_height: 2.0
           clearing: true
           marking: true
