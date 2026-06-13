@@ -14,6 +14,7 @@ from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.srv import ClearEntireCostmap
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
@@ -23,7 +24,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 import yaml
 
 from task_layer.anomaly_scanner import AnomalyScanner
-from task_layer.area_clear_check import merge_detections
+from task_layer.area_clear_check import AreaClearChecker, merge_detections
 from task_layer.photo_diff_check import (
     CameraModel,
     detect_changes,
@@ -97,8 +98,14 @@ class InspectionRunner(Node):
             Path.home() / 'roboinspec_ws' / 'baselines'))
         self.declare_parameter('photo_diff_threshold', 35)
         self.declare_parameter('photo_diff_tolerance_px', 7)
-        self.declare_parameter('photo_diff_min_area_px', 400)
-        self.declare_parameter('photo_diff_max_range', 4.0)
+        # 1500 px floor: real 0.45 m boxes never projected below 2700 px
+        # across the rehearsals, the largest surviving artifact was 667 px.
+        self.declare_parameter('photo_diff_min_area_px', 1500)
+        # Beyond ~3.5 m the ground-intersection geometry degrades (a few
+        # pixels of bottom-edge error swing the estimate by metres) and the
+        # only regions that big are alignment artifacts.
+        self.declare_parameter('photo_diff_max_range', 3.5)
+        self.declare_parameter('photo_diff_min_range', 0.3)
         # Camera mount in the base frame; keep in sync with the camera link
         # pose in sim/models/turtlebot3_burger_cam_ns/model.sdf (and with
         # the real robot's measured mount before field runs).
@@ -116,10 +123,21 @@ class InspectionRunner(Node):
         self.declare_parameter('costmap_precheck', True)
         # Occupancy values are 0-100; 50 is past the inscribed band the
         # planner will not enter. -1 (unknown) also counts as blocked.
-        self.declare_parameter('costmap_cost_threshold', 50)
+        # 120 clears the inflation overlap of a 1 m corridor (midline cost
+        # ~94 with 0.7 m inflation: narrow_passage would otherwise be
+        # condemned forever) while still catching real occupancy: an object
+        # on the goal puts lethal/inscribed (253/254) cells in the check
+        # neighborhood, and unknown (-1) always blocks.
+        self.declare_parameter('costmap_cost_threshold', 120)
         self.declare_parameter('precheck_radius', 0.18)
         self.declare_parameter('capture_nav_fail_evidence', True)
-        self.declare_parameter('scan_yaws', [0.0, 1.5708, 3.1416, -1.5708])
+        # Six headings, 60 deg apart: the rotation-alignment step of photo
+        # diff crops up to ~20 deg off one image edge (heading overshoot
+        # between baseline and revisit), and four 90 deg-spaced photos then
+        # leave coverage seams an off-axis object can hide in (observed:
+        # box at the yaw0/yaw1 seam of server_room went undetected).
+        self.declare_parameter('scan_yaws', [0.0, 1.0472, 2.0944, 3.1416,
+                                             -2.0944, -1.0472])
         self.declare_parameter('scan_settle_sec', 1.0)
         self.declare_parameter('scan_topic', 'scan')
         self.declare_parameter('image_topic', 'camera/image_raw')
@@ -152,6 +170,7 @@ class InspectionRunner(Node):
         self.robot_name = self.get_namespace().strip('/') or 'robot'
         self._cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self._anomaly_seq = 0
+        self._yaw_corrector = None  # lazy: loads the static map on first use
         # Own belief pose, independent of any detector: photo localization
         # and the post-failure displacement check both need it.
         self._own_pose = None  # (x, y, yaw)
@@ -159,6 +178,14 @@ class InspectionRunner(Node):
                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose',
                                  self._on_amcl_pose, amcl_qos)
+        # Peer belief poses: a teammate caught in an inspection photo would
+        # otherwise diff against the (empty) baseline as an anomaly.
+        self._peer_poses: dict[str, tuple[float, float]] = {}
+        for peer, topic in self._peer_pose_topics().items():
+            self.create_subscription(
+                PoseWithCovarianceStamped, topic,
+                lambda msg, name=peer: self._on_peer_pose(name, msg),
+                amcl_qos)
         self.scanner = None
         if bool(self.get_parameter('detect_anomalies').value):
             self.scanner = AnomalyScanner(
@@ -183,6 +210,32 @@ class InspectionRunner(Node):
             self.create_subscription(OccupancyGrid, 'global_costmap/costmap',
                                      self._costmap_callback, costmap_qos)
 
+    def _peer_pose_topics(self) -> dict[str, str]:
+        try:
+            path = Path(str(self.get_parameter('robots_yaml').value)).expanduser()
+            with path.open(encoding='utf-8') as f:
+                robots = (yaml.safe_load(f) or {}).get('robots', {})
+        except Exception:  # noqa: BLE001  (no registry: single-robot run)
+            return {}
+        return {name: info['amcl_pose_topic']
+                for name, info in robots.items()
+                if name != self.robot_name and info.get('amcl_pose_topic')}
+
+    def _on_peer_pose(self, name: str, msg: PoseWithCovarianceStamped):
+        p = msg.pose.pose.position
+        self._peer_poses[name] = (p.x, p.y)
+
+    def near_peer(self, x: float, y: float, radius: float = 0.9) -> bool:
+        """Is (x, y) plausibly the teammate? The radius covers the error
+        budget of comparing a camera-projected sighting against the peer's
+        own AMCL belief: both robots' localization error plus the ground-
+        intersection projection error (a transiting robot photographed
+        mid-motion landed 0.5-0.8 m from its believed pose in rehearsal).
+        Real anomalies parked within 0.9 m of a robot are accepted losses —
+        and transient: the next pass without the peer nearby reports them."""
+        return any(math.hypot(x - px, y - py) <= radius
+                   for px, py in self._peer_poses.values())
+
     def _on_amcl_pose(self, msg: PoseWithCovarianceStamped):
         p = msg.pose.pose
         q = p.orientation
@@ -198,6 +251,40 @@ class InspectionRunner(Node):
 
     def _camera_info_callback(self, msg: CameraInfo):
         self._camera_info = msg
+
+    def corrected_capture_yaw(self, x: float, y: float,
+                              believed_yaw: float) -> tuple[float, float]:
+        """Heading at capture time, refined by matching the live laser scan
+        against the static map.
+
+        AMCL's yaw belief is transiently off by up to ~0.5 rad right after
+        a rotation sequence (updates are motion-gated and convergence lags),
+        which poisons both photo-diff alignment and anomaly projection. The
+        laser is the right sensor for heading: 360 deg of wall structure,
+        texture-independent, and alignment_ratio already excludes deep-free
+        (anomaly) returns from its denominator, so a new object cannot bias
+        the fit. The retired laser detector's map machinery does the work.
+        Returns (corrected_yaw, ratio_at_best)."""
+        scan = self._latest_scan
+        if scan is None:
+            return believed_yaw, 0.0
+        if self._yaw_corrector is None:
+            self._yaw_corrector = AreaClearChecker(
+                str(self.get_parameter('map_yaml').value))
+
+        def ratio(dyaw: float) -> float:
+            return self._yaw_corrector.alignment_ratio(
+                scan, (x, y, believed_yaw + dyaw))
+
+        best = 0.0
+        for step, span in ((0.04, 0.6), (0.008, 0.06)):
+            candidates = [best + k * step
+                          for k in range(-int(span / step), int(span / step) + 1)]
+            scored = [(ratio(d), d) for d in candidates]
+            top = max(s for s, _ in scored)
+            # Plateau tie-break toward the believed heading.
+            best = min((d for s, d in scored if s >= top - 0.01), key=abs)
+        return believed_yaw + best, max(ratio(best), 0.0)
 
     def camera_model(self) -> CameraModel:
         """Intrinsics from the live camera_info when available (so a real
@@ -240,6 +327,13 @@ class InspectionRunner(Node):
                 target = self.baseline_photo_path(area_key, stop_label, yaw_index)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(photo, target)
+                # Capture pose sidecar: the diff stage compensates the
+                # heading difference between baseline and revisit exactly,
+                # so Nav2's loose yaw goal tolerance stops mattering.
+                pose = sample.get('pose_at_capture') or (
+                    stop['x'], stop['y'], float(sample.get('yaw', 0.0)))
+                target.with_suffix('.json').write_text(json.dumps(
+                    {'x': pose[0], 'y': pose[1], 'yaw': pose[2]}))
                 recorded += 1
             outcome.update({'status': 'baseline_recorded', 'photos': recorded})
             self.get_logger().info(
@@ -247,9 +341,19 @@ class InspectionRunner(Node):
                 % (area_key, stop_label, recorded))
             return outcome
 
+        if not area.get('photo_detect', True):
+            # Areas where photo diff is structurally unsound (a 1 m corridor:
+            # every wall is near-field, station parallax dwarfs any object
+            # signal — and any real obstacle there blocks the lane, which
+            # the costmap precheck/en-route cancel already reports).
+            outcome.update({'status': 'photo_detect_disabled'})
+            return outcome
         camera = self.camera_model()
         bounds = self.detect_bounds(area)
         clip = bool(area.get('photo_detect_clip_bounds', True))
+        min_range = float(area.get(
+            'photo_detect_min_range',
+            self.get_parameter('photo_diff_min_range').value))
         checked = 0
         found: list[dict] = []
         for yaw_index, sample in stop_samples:
@@ -259,12 +363,21 @@ class InspectionRunner(Node):
                 continue
             pose = sample.get('pose_at_capture') or (
                 stop['x'], stop['y'], float(sample.get('yaw', 0.0)))
+            base_pose = None
+            base_meta = base.with_suffix('.json')
+            if base_meta.exists():
+                try:
+                    meta = json.loads(base_meta.read_text())
+                    base_pose = (meta['x'], meta['y'], meta['yaw'])
+                except (ValueError, KeyError):
+                    base_pose = None
             detection = detect_changes(
                 base, photo, pose, camera,
                 threshold=int(self.get_parameter('photo_diff_threshold').value),
                 tolerance_px=int(self.get_parameter('photo_diff_tolerance_px').value),
                 min_area_px=int(self.get_parameter('photo_diff_min_area_px').value),
-                max_range=float(self.get_parameter('photo_diff_max_range').value))
+                max_range=float(self.get_parameter('photo_diff_max_range').value),
+                baseline_pose=base_pose, min_range=min_range)
             checked += 1
             for anomaly in detection['anomalies']:
                 # Bounds clip keeps doorway-leaked sightings of NEIGHBOR
@@ -273,6 +386,11 @@ class InspectionRunner(Node):
                 if (clip and bounds is not None
                         and not (bounds[0] <= anomaly['x'] <= bounds[2]
                                  and bounds[1] <= anomaly['y'] <= bounds[3])):
+                    continue
+                if self.near_peer(anomaly['x'], anomaly['y']):
+                    self.get_logger().info(
+                        '%s: change at (%.2f, %.2f) matches a peer robot '
+                        'pose, ignored' % (area_key, anomaly['x'], anomaly['y']))
                     continue
                 anomaly['detected_from'] = {
                     'stop': stop_label, 'yaw_index': yaw_index,
@@ -311,6 +429,29 @@ class InspectionRunner(Node):
                 if value < 0 or value >= threshold:
                     return True
         return False
+
+    def clear_global_costmap(self) -> bool:
+        """One-shot global costmap reset. Obstacle marks persist after the
+        object is gone until a live scan ray crosses that cell again; cells
+        the robot never re-observes (inside no-entry rooms, behind narrow
+        doorways) keep their ghosts forever and eventually condemn every
+        candidate pose of an area. Only call this when localization is
+        trusted — clearing with a bad pose bakes the error in (see the
+        rescue-order rule in DEVLOG)."""
+        client = self.create_client(
+            ClearEntireCostmap, 'global_costmap/clear_entirely_global_costmap')
+        if not client.wait_for_service(timeout_sec=3.0):
+            self.get_logger().warn('global costmap clear service unavailable')
+            return False
+        future = client.call_async(ClearEntireCostmap.Request())
+        end = time.time() + 5.0
+        while time.time() < end and not future.done():
+            rclpy.spin_once(self, timeout_sec=0.1)
+        # Give the costmap a moment to repaint from live sensor data.
+        settle = time.time() + 2.0
+        while time.time() < settle:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        return future.done()
 
     def unstick_reverse(self, distance_m: float = 0.45, speed: float = 0.08):
         """Deterministic back-off after a failed approach. Driving at an
@@ -704,7 +845,12 @@ class InspectionRunner(Node):
                 self.get_logger().info('Inspecting %s yaw=%.4f' % (area_key, yaw))
                 sample = self.collect_scan_sample(
                     stop['x'], stop['y'], yaw, area_key, area_dir, sample_index)
-                sample['pose_at_capture'] = self._own_pose
+                pose = self._own_pose
+                if pose is not None:
+                    corrected, fit = self.corrected_capture_yaw(*pose)
+                    sample['pose_at_capture'] = (pose[0], pose[1], corrected)
+                    sample['yaw_correction'] = round(corrected - pose[2], 4)
+                    sample['yaw_fit_ratio'] = round(fit, 3)
                 result['scan_samples'].append(sample)
                 stop_samples.append((yaw_index, sample))
             if self.scanner is not None and not dry_run:
@@ -719,20 +865,46 @@ class InspectionRunner(Node):
         # Areas longer than the lidar diameter (east_hall) declare
         # viewpoints_visit_all: every viewpoint is a mandatory stop and the
         # per-stop detections are merged. Otherwise candidates are
-        # alternatives and the first reachable one wins.
-        if area.get('viewpoints') and area.get('viewpoints_visit_all'):
+        # alternatives and the first reachable one wins — except during a
+        # baseline patrol, which records the first TWO reachable stops so
+        # the common "center occupied -> relocate to first ring candidate"
+        # inspection still finds a baseline at the relocated stop.
+        baseline_mode = bool(self.get_parameter('baseline_record').value)
+
+        def visit_candidates():
+            if area.get('viewpoints') and area.get('viewpoints_visit_all'):
+                for candidate in candidates:
+                    if try_reach(candidate):
+                        stops_visited.append(candidate)
+                        inspect_stop(candidate)
+                return
+            wanted_stops = 2 if baseline_mode else 1
             for candidate in candidates:
-                if try_reach(candidate):
-                    stops_visited.append(candidate)
-                    inspect_stop(candidate)
-        else:
-            for candidate in candidates:
+                if len(stops_visited) >= wanted_stops:
+                    break
                 if attempt_limit > 0 and nav_tries >= attempt_limit:
                     break
                 if try_reach(candidate):
                     stops_visited.append(candidate)
                     inspect_stop(candidate)
-                    break
+
+        visit_candidates()
+        # Distrust-the-map retry: ONE candidate physically cannot block a
+        # whole area, so when every attempt read blocked the costmap itself
+        # is suspect (stale ghosts of removed objects, or marks painted
+        # during a past pose error). Localization is fine here — the robot
+        # just navigated between areas — so clearing is safe; the truth
+        # repaints from live scans within a couple of frames.
+        blocked_states = {'precheck_blocked', 'goal_blocked_en_route'}
+        if (not stops_visited and result['nav_attempts']
+                and all((a.get('result') or {}).get('status') in blocked_states
+                        for a in result['nav_attempts'])):
+            self.get_logger().warn(
+                '%s: every candidate read blocked — clearing the global '
+                'costmap once and retrying (suspected stale ghosts)' % area_key)
+            self.clear_global_costmap()
+            result['costmap_cleared_retry'] = True
+            visit_candidates()
 
         if not stops_visited:
             result['status'] = 'nav_failed'

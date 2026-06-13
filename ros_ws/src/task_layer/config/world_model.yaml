@@ -280,6 +280,8 @@ areas:
     # 照片差分不裁剪到本区 bounds：这个门口点位的职责就是"向禁入房
     # 内看"，检出的异常坐标天然落在邻区（restricted_zone）里。
     photo_detect_clip_bounds: false
+    # 门口站位重复性差（门洞窄），0.8m 内的"变化"基本是门框近景视差。
+    photo_detect_min_range: 0.8
     color_rgba:
     - 0.949999988
     - 0.340000004
@@ -352,6 +354,10 @@ areas:
     display_name: Narrow Passage
     type: passage
     marker_model: narrow_passage_marker
+    # 1m 走廊不做照片差分：两侧墙全是近景，站位厘米级误差的视差就
+    # 淹没物体信号；且走廊里任何真障碍必然挡道——代价图预检/途中取消
+    # 本身就是该区的检测器（报 goal_blocked/改址先验）。
+    photo_detect: false
     center:
     - 5.908259
     - -5.2
