@@ -90,7 +90,17 @@ class InspectionRunner(Node):
         # The global-costmap query here is also the shared foundation the
         # A-axis (anomaly detection) reuses to flag unmapped obstacles.
         self.declare_parameter('costmap_topic', 'global_costmap/costmap')
-        self.declare_parameter('costmap_lethal_cost', 90)
+        self.declare_parameter('static_map_topic', 'map')
+        # Only TRUE lethal cells (LETHAL_OBSTACLE -> 100 in the OccupancyGrid)
+        # count: inscribed (99) and the inflation gradient bleed into FREE
+        # static-map cells around walls, so a lower threshold would falsely flag
+        # legitimate wall-adjacent goals. 100 keeps only an obstacle's actual
+        # footprint (and wall cells, which the static-map check then excludes).
+        self.declare_parameter('costmap_lethal_cost', 100)
+        # Static-map occupancy below this (and >= 0) is "free floor". Used to
+        # tell a dynamic/unmapped obstacle (lethal in costmap, free on the map)
+        # from a static wall (lethal in costmap, occupied on the map).
+        self.declare_parameter('static_free_max', 50)
         self.declare_parameter('candidate_clearance_radius', 0.22)
         self.declare_parameter('nav_goal_timeout_sec', 120.0)
 
@@ -99,6 +109,7 @@ class InspectionRunner(Node):
         self._latest_scan = None
         self._latest_image = None
         self._latest_costmap = None
+        self._latest_static_map = None
         self._run_dir = None
         scan_topic = self.get_parameter('scan_topic').value
         image_topic = self.get_parameter('image_topic').value
@@ -112,6 +123,11 @@ class InspectionRunner(Node):
         self.create_subscription(
             OccupancyGrid, self.get_parameter('costmap_topic').value,
             self._costmap_callback, costmap_qos)
+        # Static map (also latched) -- lets candidate_is_clear separate dynamic
+        # obstacles from the known walls baked into the costmap.
+        self.create_subscription(
+            OccupancyGrid, self.get_parameter('static_map_topic').value,
+            self._static_map_callback, costmap_qos)
 
     def _scan_callback(self, msg: LaserScan):
         self._latest_scan = msg
@@ -122,34 +138,69 @@ class InspectionRunner(Node):
     def _costmap_callback(self, msg: OccupancyGrid):
         self._latest_costmap = msg
 
-    def candidate_is_clear(self, x: float, y: float) -> bool:
-        """True if (x, y) and a small footprint neighborhood are below the
-        lethal cost in the latest global costmap.
+    def _static_map_callback(self, msg: OccupancyGrid):
+        self._latest_static_map = msg
 
-        No costmap yet / out of map => optimistic True: let Nav2 try, with the
-        per-goal timeout in send_goal_and_wait as the universal backstop. A
-        False means an obstacle that is NOT on the static map occupies the
-        candidate -- exactly the signal the A-axis will publish as an anomaly;
-        for B we only use it to pick a reachable standoff pose."""
-        grid = self._latest_costmap
+    @staticmethod
+    def _grid_value(grid: OccupancyGrid, x: float, y: float):
+        """Occupancy/cost at world (x, y) in an OccupancyGrid, or None if the
+        grid is missing or the point falls outside it."""
         if grid is None:
+            return None
+        info = grid.info
+        if info.resolution <= 0.0:
+            return None
+        col = math.floor((x - info.origin.position.x) / info.resolution)
+        row = math.floor((y - info.origin.position.y) / info.resolution)
+        if 0 <= col < info.width and 0 <= row < info.height:
+            return grid.data[row * info.width + col]
+        return None
+
+    def candidate_is_clear(self, x: float, y: float) -> bool:
+        """False only when an UNMAPPED (dynamic) obstacle occupies the candidate
+        footprint -- i.e. a costmap cell at lethal cost whose location is FREE
+        on the static map.
+
+        Static walls are lethal in the costmap too, but the static map marks
+        them occupied, so they are deliberately NOT treated as blocking; their
+        inflation gradient is excluded by the lethal>=100 threshold. This is
+        what keeps legitimate wall-adjacent goals (the charging dock, doorway
+        viewpoints) from being falsely cancelled. The False signal -- lethal
+        cost over free static-map floor -- is exactly the unmapped-obstacle
+        event the A-axis will publish as an anomaly; B only uses it to pick a
+        reachable standoff pose.
+
+        No costmap or no static map yet / out of map => optimistic True: let
+        Nav2 try, with the per-goal timeout in send_goal_and_wait as the
+        universal backstop."""
+        grid = self._latest_costmap
+        static = self._latest_static_map
+        if grid is None or static is None:
             return True
         info = grid.info
         if info.resolution <= 0.0:
             return True
         lethal = int(self.get_parameter('costmap_lethal_cost').value)
+        free_max = int(self.get_parameter('static_free_max').value)
         radius = float(self.get_parameter('candidate_clearance_radius').value)
         steps = max(0, int(radius / info.resolution))
-        base_col = int((x - info.origin.position.x) / info.resolution)
-        base_row = int((y - info.origin.position.y) / info.resolution)
+        base_col = math.floor((x - info.origin.position.x) / info.resolution)
+        base_row = math.floor((y - info.origin.position.y) / info.resolution)
         for d_row in range(-steps, steps + 1):
             for d_col in range(-steps, steps + 1):
                 col = base_col + d_col
                 row = base_row + d_row
-                if 0 <= col < info.width and 0 <= row < info.height:
-                    cost = grid.data[row * info.width + col]
-                    if cost >= lethal:
-                        return False
+                if not (0 <= col < info.width and 0 <= row < info.height):
+                    continue
+                if grid.data[row * info.width + col] < lethal:
+                    continue
+                # Lethal in the costmap. Only count it as a dynamic obstacle if
+                # the static map does NOT explain it (free floor at that spot).
+                wx = info.origin.position.x + (col + 0.5) * info.resolution
+                wy = info.origin.position.y + (row + 0.5) * info.resolution
+                static_val = self._grid_value(static, wx, wy)
+                if static_val is not None and 0 <= static_val < free_max:
+                    return False
         return True
 
     def load_world_model(self) -> dict:
@@ -290,7 +341,11 @@ class InspectionRunner(Node):
         goal_y = float(goal.pose.pose.position.y)
         started = time.time()
         send_future = self._client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, send_future)
+        # Bound the goal-request phase too: a server that accepts connections
+        # but never answers send_goal would otherwise hang the mission forever.
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=timeout)
+        if not send_future.done():
+            return {'status': 'send_timeout', 'duration_sec': round(time.time() - started, 3)}
         goal_handle = send_future.result()
         if goal_handle is None or not goal_handle.accepted:
             return {'status': 'rejected', 'duration_sec': round(time.time() - started, 3)}
@@ -303,7 +358,17 @@ class InspectionRunner(Node):
                 'Cancelling nav goal (%.3f, %.3f): %s' % (goal_x, goal_y, reason))
             cancel_future = goal_handle.cancel_goal_async()
             rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=5.0)
-            return {'status': reason, 'duration_sec': round(time.time() - started, 3)}
+            # Wait (bounded) for the goal to actually reach a terminal state
+            # before returning, so dispatching the next goal can't preempt-race
+            # a goal the server is still winding down.
+            settle_deadline = time.time() + 5.0
+            while rclpy.ok() and not result_future.done() and time.time() < settle_deadline:
+                rclpy.spin_once(self, timeout_sec=0.1)
+            return {
+                'status': reason,
+                'cancel_terminal': 'confirmed' if result_future.done() else 'unconfirmed',
+                'duration_sec': round(time.time() - started, 3),
+            }
 
         last_blocked_check = 0.0
         while rclpy.ok() and not result_future.done():
