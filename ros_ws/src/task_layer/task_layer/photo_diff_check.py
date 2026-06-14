@@ -29,14 +29,19 @@ import numpy as np
 @dataclass
 class CameraModel:
     """Pinhole intrinsics + mount pose in the robot base frame."""
-    fx: float = 320.0
-    fy: float = 320.0
-    cx: float = 320.5
-    cy: float = 240.5
-    width: int = 640
-    height: int = 480
-    mount_x: float = 0.076   # camera ahead of base origin (m)
-    mount_z: float = 0.250   # camera height above floor (m)
+    # ASUS C3 simulation truth from
+    # sim/models/turtlebot3_burger_cam_ns/model.sdf: 1280x720 and
+    # horizontal_fov=1.5708 rad, hence fx=640/tan(45 deg)=640 px. Square
+    # pixels give fy=640; the optical centre is the image midpoint.
+    fx: float = 640.0
+    fy: float = 640.0
+    cx: float = 639.5
+    cy: float = 359.5
+    width: int = 1280
+    height: int = 720
+    # The same model.sdf camera link pose is <pose>0.076 0 0.093 ...</pose>.
+    mount_x: float = 0.076
+    mount_z: float = 0.093
 
 
 def load_image(path: str | Path) -> np.ndarray:
@@ -208,8 +213,8 @@ def diff_mask(baseline: np.ndarray, current: np.ndarray,
     return mask
 
 
-def changed_regions(mask: np.ndarray, min_area_px: int = 1500,
-                    min_height_px: int = 15,
+def changed_regions(mask: np.ndarray, min_area_px: int = 1800,
+                    min_width_px: int = 40, min_height_px: int = 40,
                     max_aspect: float = 6.0) -> list[dict]:
     """Connected changed regions large enough to matter, as
     {'bbox': (x, y, w, h), 'area_px': int} sorted by area, biggest first.
@@ -219,18 +224,19 @@ def changed_regions(mask: np.ndarray, min_area_px: int = 1500,
     horizontal slivers — floor/wall boundary parallax residue that survives
     the tolerance band — are rejected by min height and aspect ratio.
 
-    The min area is calibrated against a survey of every detection across
-    four full-map runs: real 0.45 m boxes never projected below 2700 px
-    (the box face fills the frame), while the largest residual artifact
-    that survived bounds-clip and merging was 667 px — a clean 4x gap, so
-    1500 px drops artifacts with margin to spare. For the Final phase's
-    small graspable objects this floor must come down with the vision
-    route that replaces this scenario."""
+    The size floors are tied to target geometry rather than a particular map:
+    a 0.4 m square face at 3 m projects to
+    (640 * 0.4 / 3)^2 ~= 7280 px. Requiring only one quarter of that face
+    to survive texture, occlusion and morphology gives ~=1820 px, rounded
+    to 1800. Its projected width/height is ~=85 px; requiring about half
+    (40 px) rejects thin doorway-edge parallax while retaining a partially
+    visible target. Smaller targets or longer ranges require overrides."""
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask)
     regions = []
     for index in range(1, count):
         x, y, w, h, area = stats[index]
-        if area < min_area_px or h < min_height_px or w / max(h, 1) > max_aspect:
+        if (area < min_area_px or w < min_width_px or h < min_height_px
+                or w / max(h, 1) > max_aspect):
             continue
         regions.append({'bbox': (int(x), int(y), int(w), int(h)),
                         'area_px': int(area)})
@@ -241,7 +247,8 @@ def changed_regions(mask: np.ndarray, min_area_px: int = 1500,
 def ground_point(region: dict, camera: CameraModel,
                  robot_pose: tuple[float, float, float],
                  max_range: float = 3.5, min_range: float = 0.3,
-                 max_height_m: float = 1.8) -> dict | None:
+                 max_height_m: float = 1.8,
+                 min_extent_m: float = 0.25) -> dict | None:
     """Map-frame floor position of a changed region.
 
     The region's bottom-center pixel is where the new object meets the
@@ -272,13 +279,19 @@ def ground_point(region: dict, camera: CameraModel,
         if implied_height > max_height_m:
             return None
     lateral = -forward * (u - camera.cx) / camera.fx
+    extent = w / camera.fx * forward       # physical width estimate
+    # The cycle target is a 0.4 m-class box. Requiring 0.25 m visible width
+    # keeps a partially occluded target (62.5% of nominal width) while
+    # rejecting doorway-edge parallax that can be tall in pixels but only a
+    # few centimetres wide after perspective projection.
+    if extent < min_extent_m:
+        return None
     bx = forward + camera.mount_x          # robot frame, x forward y left
     by = lateral
     rx, ry, ryaw = robot_pose
     cos_y, sin_y = math.cos(ryaw), math.sin(ryaw)
     map_x = rx + bx * cos_y - by * sin_y
     map_y = ry + bx * sin_y + by * cos_y
-    extent = w / camera.fx * forward       # physical width estimate
     return {
         'x': round(float(map_x), 3),
         'y': round(float(map_y), 3),
@@ -293,9 +306,11 @@ def detect_changes(baseline_path: str | Path, current_path: str | Path,
                    robot_pose: tuple[float, float, float],
                    camera: CameraModel | None = None,
                    threshold: int = 35, tolerance_px: int = 7,
-                   min_area_px: int = 1500, max_range: float = 3.5,
+                   min_area_px: int = 1800, min_width_px: int = 40,
+                   min_height_px: int = 40, max_range: float = 3.0,
                    baseline_pose: tuple[float, float, float] | None = None,
-                   min_range: float = 0.3) -> dict:
+                   min_range: float = 0.3,
+                   min_extent_m: float = 0.25) -> dict:
     """Full pipeline: baseline photo + current photo + robot pose at capture
     -> {'status', 'anomalies': [{'x','y','range','extent','bbox',...}]}.
 
@@ -339,9 +354,11 @@ def detect_changes(baseline_path: str | Path, current_path: str | Path,
         pose_for_projection = (robot_pose[0], robot_pose[1],
                                baseline_pose[2] + yaw_offset)
     anomalies = []
-    for region in changed_regions(mask, min_area_px):
+    for region in changed_regions(
+            mask, min_area_px, min_width_px, min_height_px):
         point = ground_point(region, camera, pose_for_projection, max_range,
-                             min_range=min_range)
+                             min_range=min_range,
+                             min_extent_m=min_extent_m)
         if point is not None:
             anomalies.append(point)
     return {'status': 'checked', 'anomalies': anomalies,

@@ -28,4 +28,10 @@ install(PROGRAMS
   task_layer/area_clear_acceptance.py
   DESTINATION lib/${PROJECT_NAME})
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_photo_baseline test/test_photo_baseline.py)
+  ament_add_pytest_test(test_photo_diff_check test/test_photo_diff_check.py)
+endif()
+
 ament_package()

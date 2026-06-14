@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import math
 from pathlib import Path
 import time
@@ -9,17 +10,37 @@ import time
 import rclpy
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image, LaserScan
+from std_msgs.msg import String
+from visualization_msgs.msg import Marker, MarkerArray
 import yaml
 
+from task_layer.photo_baseline import (
+    BaselineLibrary,
+    pose_distance,
+    pose_within_tolerance,
+)
 from task_layer.report_writer import default_report_dir, write_report
 from task_layer.scan_analyzer import aggregate_scan_summaries, summarize_scan
+
+try:
+    from task_layer.photo_diff_check import (
+        CameraModel,
+        detect_changes,
+        merge_photo_detections,
+    )
+    PHOTO_DIFF_IMPORT_ERROR = None
+except (ImportError, ModuleNotFoundError) as exc:
+    CameraModel = None
+    detect_changes = None
+    merge_photo_detections = None
+    PHOTO_DIFF_IMPORT_ERROR = str(exc)
 
 
 STATUS_TEXT = {
@@ -103,6 +124,31 @@ class InspectionRunner(Node):
         self.declare_parameter('static_free_max', 50)
         self.declare_parameter('candidate_clearance_radius', 0.22)
         self.declare_parameter('nav_goal_timeout_sec', 120.0)
+        # Photo baseline capture/diff. The baseline station threshold is the
+        # configured Nav2 xy_goal_tolerance (0.25 m) plus 0.05 m localization
+        # allowance. Translation is deliberately not image-warped: beyond this
+        # repeatability envelope parallax becomes scene-depth dependent.
+        self.declare_parameter('baseline_capture', False)
+        self.declare_parameter(
+            'baseline_dir',
+            str(Path.home() / 'roboinspec_ws' / 'baselines' / 'photo_diff'))
+        self.declare_parameter('baseline_pose_tolerance', 0.30)
+        # A 0.4 m square target at 3 m projects to about 85x85=7280 px with
+        # fx=640. Requiring 25% stable changed pixels gives ~1820 px, while
+        # requiring about half the projected width/height gives 40 px.
+        self.declare_parameter('photo_diff_min_area_px', 1800)
+        self.declare_parameter('photo_diff_min_width_px', 40)
+        self.declare_parameter('photo_diff_min_height_px', 40)
+        self.declare_parameter('photo_diff_max_range', 3.0)
+        self.declare_parameter('photo_diff_min_range', 0.3)
+        # Preserve a partially visible 0.4 m target while rejecting projected
+        # slivers whose physical width is inconsistent with that target class.
+        self.declare_parameter('photo_diff_min_extent_m', 0.25)
+        self.declare_parameter('photo_diff_threshold', 35)
+        self.declare_parameter('photo_diff_tolerance_px', 7)
+        # One 0.4 m object can produce nearby estimates in adjacent views;
+        # 0.6 m covers its footprint plus the <0.3 m localization error goal.
+        self.declare_parameter('photo_diff_merge_distance', 0.6)
 
         action_name = self.get_parameter('action_name').value
         self._client = ActionClient(self, NavigateToPose, action_name)
@@ -110,7 +156,12 @@ class InspectionRunner(Node):
         self._latest_image = None
         self._latest_costmap = None
         self._latest_static_map = None
+        self._own_pose = None
         self._run_dir = None
+        self._baseline_library = None
+        self._baseline_library_failed = False
+        self._anomaly_seq = 0
+        self.robot_name = self.get_namespace().strip('/') or 'robot'
         # Set True once a nav goal cannot be confirmed terminal (cancel not
         # confirmed, or a send timed out with a possibly-pending request). While
         # set, NO further nav goal is dispatched -- commanding a new goal while a
@@ -120,6 +171,12 @@ class InspectionRunner(Node):
         image_topic = self.get_parameter('image_topic').value
         self.create_subscription(LaserScan, scan_topic, self._scan_callback, 10)
         self.create_subscription(Image, image_topic, self._image_callback, 10)
+        amcl_qos = QoSProfile(depth=1)
+        amcl_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        amcl_qos.reliability = QoSReliabilityPolicy.RELIABLE
+        self.create_subscription(
+            PoseWithCovarianceStamped, 'amcl_pose',
+            self._amcl_pose_callback, amcl_qos)
         # The global costmap is latched (transient_local); QoS must match or
         # the subscription receives nothing.
         costmap_qos = QoSProfile(depth=1)
@@ -133,6 +190,17 @@ class InspectionRunner(Node):
         self.create_subscription(
             OccupancyGrid, self.get_parameter('static_map_topic').value,
             self._static_map_callback, costmap_qos)
+        latched = QoSProfile(depth=10)
+        latched.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        latched.reliability = QoSReliabilityPolicy.RELIABLE
+        self._event_pub = self.create_publisher(
+            String, '/anomaly_events', latched)
+        self._marker_pub = self.create_publisher(
+            MarkerArray, '/anomaly_markers', latched)
+        if PHOTO_DIFF_IMPORT_ERROR:
+            self.get_logger().warn(
+                'Photo-diff detector unavailable; inspection will continue '
+                f'without visual detection: {PHOTO_DIFF_IMPORT_ERROR}')
 
     def _scan_callback(self, msg: LaserScan):
         self._latest_scan = msg
@@ -140,11 +208,305 @@ class InspectionRunner(Node):
     def _image_callback(self, msg: Image):
         self._latest_image = msg
 
+    def _amcl_pose_callback(self, msg: PoseWithCovarianceStamped):
+        pose = msg.pose.pose
+        orientation = pose.orientation
+        yaw = math.atan2(
+            2.0 * (
+                orientation.w * orientation.z
+                + orientation.x * orientation.y),
+            1.0 - 2.0 * (
+                orientation.y * orientation.y
+                + orientation.z * orientation.z),
+        )
+        self._own_pose = (
+            float(pose.position.x),
+            float(pose.position.y),
+            float(yaw),
+        )
+
     def _costmap_callback(self, msg: OccupancyGrid):
         self._latest_costmap = msg
 
     def _static_map_callback(self, msg: OccupancyGrid):
         self._latest_static_map = msg
+
+    def baseline_library(self) -> BaselineLibrary | None:
+        if self._baseline_library is not None:
+            return self._baseline_library
+        if self._baseline_library_failed:
+            return None
+        try:
+            self._baseline_library = BaselineLibrary(
+                str(self.get_parameter('baseline_dir').value))
+        except Exception as exc:  # noqa: BLE001 - visual failure is isolated.
+            self._baseline_library_failed = True
+            self.get_logger().warn(
+                f'Baseline library unavailable; photo diff skipped: {exc}')
+        return self._baseline_library
+
+    @staticmethod
+    def camera_model():
+        if CameraModel is None:
+            return None
+        return CameraModel()
+
+    def photo_diff_parameters(self) -> dict:
+        camera = self.camera_model()
+        return {
+            'baseline_capture': bool(
+                self.get_parameter('baseline_capture').value),
+            'baseline_dir': str(self.get_parameter('baseline_dir').value),
+            'baseline_pose_tolerance_m': float(
+                self.get_parameter('baseline_pose_tolerance').value),
+            'min_area_px': int(
+                self.get_parameter('photo_diff_min_area_px').value),
+            'min_width_px': int(
+                self.get_parameter('photo_diff_min_width_px').value),
+            'min_height_px': int(
+                self.get_parameter('photo_diff_min_height_px').value),
+            'max_range_m': float(
+                self.get_parameter('photo_diff_max_range').value),
+            'min_range_m': float(
+                self.get_parameter('photo_diff_min_range').value),
+            'min_extent_m': float(
+                self.get_parameter('photo_diff_min_extent_m').value),
+            'pixel_threshold': int(
+                self.get_parameter('photo_diff_threshold').value),
+            'local_tolerance_px': int(
+                self.get_parameter('photo_diff_tolerance_px').value),
+            'merge_distance_m': float(
+                self.get_parameter('photo_diff_merge_distance').value),
+            'camera': ({
+                'width': camera.width,
+                'height': camera.height,
+                'fx': camera.fx,
+                'fy': camera.fy,
+                'cx': camera.cx,
+                'cy': camera.cy,
+                'mount_x': camera.mount_x,
+                'mount_z': camera.mount_z,
+            } if camera is not None else None),
+        }
+
+    def process_photo_views(self, area_key: str, samples: list[dict]) -> dict:
+        """Record clean views or compare captured views with their baselines.
+
+        Every failure in this path is converted to a per-view status so visual
+        processing cannot interrupt navigation, return-home, or report output.
+        """
+        capture_mode = bool(self.get_parameter('baseline_capture').value)
+        outcome = {
+            'mode': 'baseline_capture' if capture_mode else 'detect',
+            'status': 'pending',
+            'views': [],
+            'anomalies': [],
+        }
+        library = self.baseline_library()
+        if library is None:
+            outcome['status'] = 'baseline_library_unavailable'
+            return outcome
+
+        found = []
+        checked = 0
+        recorded = 0
+        for view_index, sample in enumerate(samples, start=1):
+            capture = sample.get('image_capture') or {}
+            image_path = capture.get('image_path')
+            pose = sample.get('capture_pose')
+            view = {'view_index': view_index, 'status': 'pending'}
+            outcome['views'].append(view)
+            if (sample.get('turn_result') or {}).get('status') != 'succeeded':
+                view['status'] = 'turn_not_succeeded'
+                continue
+            if not image_path or pose is None:
+                view['status'] = 'image_or_pose_missing'
+                continue
+
+            if capture_mode:
+                try:
+                    entry = library.record(
+                        area_key, view_index, image_path, pose)
+                    view.update({
+                        'status': 'baseline_recorded',
+                        'baseline_image': entry['image_path'],
+                        'baseline_pose': entry['pose'],
+                    })
+                    recorded += 1
+                except Exception as exc:  # noqa: BLE001
+                    view.update({'status': 'baseline_record_failed',
+                                 'error': str(exc)})
+                    self.get_logger().warn(
+                        f'{area_key} view {view_index}: baseline record '
+                        f'failed, continuing: {exc}')
+                continue
+
+            try:
+                entry = library.lookup(area_key, view_index)
+            except Exception as exc:  # noqa: BLE001
+                view.update({'status': 'baseline_index_error',
+                             'error': str(exc)})
+                self.get_logger().warn(
+                    f'{area_key} view {view_index}: invalid baseline index '
+                    f'entry, continuing: {exc}')
+                continue
+            if entry is None:
+                view['status'] = 'baseline_missing'
+                continue
+            baseline_pose = entry.get('pose') or {}
+            try:
+                distance = pose_distance(pose, baseline_pose)
+            except (KeyError, TypeError, ValueError) as exc:
+                view.update({'status': 'baseline_pose_invalid',
+                             'error': str(exc)})
+                continue
+            view['baseline_pose_distance_m'] = round(distance, 4)
+            tolerance = float(
+                self.get_parameter('baseline_pose_tolerance').value)
+            if not pose_within_tolerance(pose, baseline_pose, tolerance):
+                view['status'] = 'baseline_pose_too_far'
+                self.get_logger().warn(
+                    f'{area_key} view {view_index}: station moved '
+                    f'{distance:.3f} m > {tolerance:.3f} m; photo diff skipped')
+                continue
+            if detect_changes is None:
+                view.update({'status': 'detector_unavailable',
+                             'error': PHOTO_DIFF_IMPORT_ERROR})
+                continue
+
+            try:
+                detection = detect_changes(
+                    entry['image_path'],
+                    image_path,
+                    (float(pose['x']), float(pose['y']), float(pose['yaw'])),
+                    self.camera_model(),
+                    threshold=int(
+                        self.get_parameter('photo_diff_threshold').value),
+                    tolerance_px=int(
+                        self.get_parameter('photo_diff_tolerance_px').value),
+                    min_area_px=int(
+                        self.get_parameter('photo_diff_min_area_px').value),
+                    min_width_px=int(
+                        self.get_parameter('photo_diff_min_width_px').value),
+                    min_height_px=int(
+                        self.get_parameter('photo_diff_min_height_px').value),
+                    max_range=float(
+                        self.get_parameter('photo_diff_max_range').value),
+                    baseline_pose=(
+                        float(baseline_pose['x']),
+                        float(baseline_pose['y']),
+                        float(baseline_pose['yaw']),
+                    ),
+                    min_range=float(
+                        self.get_parameter('photo_diff_min_range').value),
+                    min_extent_m=float(
+                        self.get_parameter('photo_diff_min_extent_m').value),
+                )
+                checked += 1
+                view.update({
+                    'status': detection.get('status', 'checked'),
+                    'baseline_image': entry['image_path'],
+                    'current_image': image_path,
+                    'anomaly_count': len(detection.get('anomalies', [])),
+                    'yaw_offset': detection.get('yaw_offset'),
+                })
+                for anomaly in detection.get('anomalies', []):
+                    anomaly = dict(anomaly)
+                    anomaly.update({
+                        'type': 'photo_diff',
+                        'evidence_photo': image_path,
+                        'detected_from': {
+                            'view_index': view_index,
+                            'pose': dict(pose),
+                        },
+                    })
+                    found.append(anomaly)
+            except Exception as exc:  # noqa: BLE001
+                view.update({'status': 'detector_error', 'error': str(exc)})
+                self.get_logger().warn(
+                    f'{area_key} view {view_index}: photo detector failed, '
+                    f'continuing: {exc}')
+
+        if capture_mode:
+            outcome['status'] = (
+                'baseline_recorded' if recorded else 'no_baseline_recorded')
+            outcome['recorded_count'] = recorded
+            return outcome
+
+        if merge_photo_detections is not None:
+            try:
+                found = merge_photo_detections(
+                    [], found,
+                    link_dist=float(
+                        self.get_parameter(
+                            'photo_diff_merge_distance').value))
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(
+                    f'{area_key}: anomaly merge failed, retaining raw '
+                    f'detections: {exc}')
+        outcome['anomalies'] = found
+        outcome['photos_checked'] = checked
+        outcome['status'] = 'checked' if checked else 'no_comparable_baseline'
+        for anomaly in found:
+            try:
+                self.publish_anomaly(
+                    area_key, anomaly, anomaly.get('detected_from') or {})
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(
+                    f'{area_key}: anomaly publication failed, continuing: '
+                    f'{exc}')
+        return outcome
+
+    def publish_anomaly(self, area_key: str, anomaly: dict, viewpoint: dict):
+        self._anomaly_seq += 1
+        event = {
+            'robot': self.robot_name,
+            'stamp': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'type': 'photo_diff',
+            'area': area_key,
+            'x': anomaly['x'],
+            'y': anomaly['y'],
+            'extent': anomaly.get('extent'),
+            'evidence_photo': anomaly.get('evidence_photo'),
+            'viewpoint': viewpoint,
+        }
+        self._event_pub.publish(String(data=json.dumps(event)))
+
+        body = Marker()
+        body.header.frame_id = 'map'
+        body.header.stamp = self.get_clock().now().to_msg()
+        body.ns = f'{self.robot_name}/photo_diff'
+        body.id = self._anomaly_seq
+        body.type = Marker.CYLINDER
+        body.action = Marker.ADD
+        body.pose.position.x = float(anomaly['x'])
+        body.pose.position.y = float(anomaly['y'])
+        body.pose.position.z = 0.25
+        body.pose.orientation.w = 1.0
+        body.scale.x = body.scale.y = 0.30
+        body.scale.z = 0.50
+        body.color.r, body.color.g, body.color.b = 1.0, 0.1, 0.1
+        body.color.a = 0.85
+
+        label = Marker()
+        label.header = body.header
+        label.ns = f'{self.robot_name}/photo_diff_labels'
+        label.id = self._anomaly_seq
+        label.type = Marker.TEXT_VIEW_FACING
+        label.action = Marker.ADD
+        label.pose.position.x = float(anomaly['x'])
+        label.pose.position.y = float(anomaly['y'])
+        label.pose.position.z = 0.75
+        label.pose.orientation.w = 1.0
+        label.scale.z = 0.22
+        label.color.r, label.color.g, label.color.b = 0.8, 0.0, 0.0
+        label.color.a = 1.0
+        label.text = (
+            f"{area_key} ({anomaly['x']:.2f}, {anomaly['y']:.2f})")
+        self._marker_pub.publish(MarkerArray(markers=[body, label]))
+        self.get_logger().warn(
+            'PHOTO-DIFF anomaly %d in %s at (%.2f, %.2f)'
+            % (self._anomaly_seq, area_key, anomaly['x'], anomaly['y']))
 
     @staticmethod
     def _grid_value(grid: OccupancyGrid, x: float, y: float):
@@ -491,11 +853,28 @@ class InspectionRunner(Node):
         nav_result = self.send_goal_and_wait(goal)
         self.wait_for_sensor_settle()
         summary = summarize_scan(self._latest_scan)
+        image_capture = self.capture_image(
+            area_key, area_dir, index, yaw)
+        observed_pose = self._own_pose
+        if observed_pose is None:
+            observed_pose = (float(x), float(y), float(yaw))
+            pose_source = 'commanded_fallback'
+        else:
+            pose_source = 'amcl_at_capture'
         summary.update({
             'index': index,
             'yaw': round(float(yaw), 4),
             'turn_result': nav_result,
-            'image_capture': self.capture_image(area_key, area_dir, index, yaw),
+            # Actual station pose at capture time. Translation is used only as
+            # a compatibility gate; detect_changes compensates yaw but never
+            # pretends a viewpoint translation is a single image-plane warp.
+            'capture_pose': {
+                'x': round(observed_pose[0], 4),
+                'y': round(observed_pose[1], 4),
+                'yaw': round(observed_pose[2], 4),
+            },
+            'capture_pose_source': pose_source,
+            'image_capture': image_capture,
         })
         return summary
 
@@ -526,6 +905,13 @@ class InspectionRunner(Node):
             'candidate_spread_ratio': float(self.get_parameter('candidate_spread_ratio').value),
             'scan_sequence': [round(yaw, 4) for yaw in scan_yaws],
             'scan_samples': [],
+            'photo_diff': {
+                'mode': ('baseline_capture' if bool(
+                    self.get_parameter('baseline_capture').value) else 'detect'),
+                'status': 'not_run',
+                'views': [],
+                'anomalies': [],
+            },
         }
 
         area_dir.mkdir(parents=True, exist_ok=True)
@@ -633,6 +1019,8 @@ class InspectionRunner(Node):
                 result['reason'] = 'nav_goal_unconfirmed_terminal_during_scan'
                 return result
 
+        result['photo_diff'] = self.process_photo_views(
+            area_key, result['scan_samples'])
         result['scan_summary'] = aggregate_scan_summaries(result['scan_samples'])
         result['status'] = 'checked'
         return result
@@ -760,6 +1148,7 @@ class InspectionRunner(Node):
                     image_paths.append(capture['image_path'])
 
             all_image_paths = nav_fail_image_paths + image_paths
+            photo_diff = area.get('photo_diff') or {}
             area_summary = {
                 'sequence_index': area.get('sequence_index'),
                 'area': area.get('target_area'),
@@ -768,6 +1157,8 @@ class InspectionRunner(Node):
                 'evidence_dir': area.get('evidence_dir'),
                 'captured_image_count': len(all_image_paths),
                 'image_paths': all_image_paths,
+                'photo_diff_status': photo_diff.get('status'),
+                'anomalies': photo_diff.get('anomalies', []),
             }
             if nav_fail_image_paths:
                 area_summary['nav_fail_image_paths'] = nav_fail_image_paths
@@ -788,6 +1179,9 @@ class InspectionRunner(Node):
             'run_dir': detail_report.get('run_dir'),
             'route': detail_report.get('route'),
             'summary': summary,
+            'photo_diff_parameters': detail_report.get(
+                'photo_diff_parameters'),
+            'anomalies': detail_report.get('anomalies', []),
             'areas': areas,
             'return_home': {
                 'attempted': return_home.get('attempted'),
@@ -796,8 +1190,10 @@ class InspectionRunner(Node):
             },
             'details_file': str(details_path),
             'notes': [
-                'This v0.2 report records inspection execution and photo evidence only.',
-                'No LiDAR or visual anomaly judgment is included in this report.',
+                'Photo-diff compares each view only with a baseline captured '
+                'from a station within baseline_pose_tolerance_m.',
+                'Missing baselines or detector errors are isolated from '
+                'mission execution.',
             ],
         }
 
@@ -814,6 +1210,7 @@ class InspectionRunner(Node):
             'status': 'pending',
             'run_dir': str(run_dir),
             'route': route,
+            'photo_diff_parameters': self.photo_diff_parameters(),
             'execution_policy': {
                 'continue_on_area_nav_fail': True,
                 'return_home_after_route': bool(self.get_parameter('return_home').value),
@@ -841,11 +1238,20 @@ class InspectionRunner(Node):
         failed = [area for area in report['areas'] if area.get('status') == 'nav_failed']
         unchecked = [area for area in report['areas'] if area.get('status') == 'unchecked']
         aborted = [area for area in report['areas'] if area.get('status') == 'nav_aborted']
+        anomalies = []
+        for area in report['areas']:
+            for anomaly in (area.get('photo_diff') or {}).get('anomalies', []):
+                anomalies.append({
+                    'area': area.get('target_area'),
+                    **anomaly,
+                })
+        report['anomalies'] = anomalies
         report['summary'].update({
             'checked_count': len(checked),
             'failed_count': len(failed),
             'unchecked_count': len(unchecked),
             'aborted_count': len(aborted),
+            'anomaly_count': len(anomalies),
         })
 
         report['return_home'] = self.return_home_result(world_model, dry_run)
