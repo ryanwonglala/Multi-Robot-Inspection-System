@@ -11,8 +11,10 @@ from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image, LaserScan
 import yaml
 
@@ -66,7 +68,7 @@ class InspectionRunner(Node):
         self.declare_parameter('candidate_offset', 0.5)
         self.declare_parameter('candidate_spread_ratio', 0.35)
         self.declare_parameter('bounds_margin', 0.25)
-        self.declare_parameter('max_candidate_attempts_per_area', 2)
+        self.declare_parameter('max_candidate_attempts_per_area', 4)
         self.declare_parameter('capture_nav_fail_evidence', True)
         self.declare_parameter('scan_yaws', [0.0, 1.5708, 3.1416, -1.5708])
         self.declare_parameter('scan_settle_sec', 1.0)
@@ -83,22 +85,72 @@ class InspectionRunner(Node):
         self.declare_parameter('home_yaw', 0.0)
         self.declare_parameter('return_home_standoff_distance', 0.0)
         self.declare_parameter('dry_run', False)
+        # --- Navigation resilience (B-axis): never collide/hug/deadlock; a
+        # blocked area is skipped gracefully so the mission always completes.
+        # The global-costmap query here is also the shared foundation the
+        # A-axis (anomaly detection) reuses to flag unmapped obstacles.
+        self.declare_parameter('costmap_topic', 'global_costmap/costmap')
+        self.declare_parameter('costmap_lethal_cost', 90)
+        self.declare_parameter('candidate_clearance_radius', 0.22)
+        self.declare_parameter('nav_goal_timeout_sec', 120.0)
 
         action_name = self.get_parameter('action_name').value
         self._client = ActionClient(self, NavigateToPose, action_name)
         self._latest_scan = None
         self._latest_image = None
+        self._latest_costmap = None
         self._run_dir = None
         scan_topic = self.get_parameter('scan_topic').value
         image_topic = self.get_parameter('image_topic').value
         self.create_subscription(LaserScan, scan_topic, self._scan_callback, 10)
         self.create_subscription(Image, image_topic, self._image_callback, 10)
+        # The global costmap is latched (transient_local); QoS must match or
+        # the subscription receives nothing.
+        costmap_qos = QoSProfile(depth=1)
+        costmap_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        costmap_qos.reliability = QoSReliabilityPolicy.RELIABLE
+        self.create_subscription(
+            OccupancyGrid, self.get_parameter('costmap_topic').value,
+            self._costmap_callback, costmap_qos)
 
     def _scan_callback(self, msg: LaserScan):
         self._latest_scan = msg
 
     def _image_callback(self, msg: Image):
         self._latest_image = msg
+
+    def _costmap_callback(self, msg: OccupancyGrid):
+        self._latest_costmap = msg
+
+    def candidate_is_clear(self, x: float, y: float) -> bool:
+        """True if (x, y) and a small footprint neighborhood are below the
+        lethal cost in the latest global costmap.
+
+        No costmap yet / out of map => optimistic True: let Nav2 try, with the
+        per-goal timeout in send_goal_and_wait as the universal backstop. A
+        False means an obstacle that is NOT on the static map occupies the
+        candidate -- exactly the signal the A-axis will publish as an anomaly;
+        for B we only use it to pick a reachable standoff pose."""
+        grid = self._latest_costmap
+        if grid is None:
+            return True
+        info = grid.info
+        if info.resolution <= 0.0:
+            return True
+        lethal = int(self.get_parameter('costmap_lethal_cost').value)
+        radius = float(self.get_parameter('candidate_clearance_radius').value)
+        steps = max(0, int(radius / info.resolution))
+        base_col = int((x - info.origin.position.x) / info.resolution)
+        base_row = int((y - info.origin.position.y) / info.resolution)
+        for d_row in range(-steps, steps + 1):
+            for d_col in range(-steps, steps + 1):
+                col = base_col + d_col
+                row = base_row + d_row
+                if 0 <= col < info.width and 0 <= row < info.height:
+                    cost = grid.data[row * info.width + col]
+                    if cost >= lethal:
+                        return False
+        return True
 
     def load_world_model(self) -> dict:
         path = Path(self.get_parameter('world_model_path').value).expanduser()
@@ -234,6 +286,8 @@ class InspectionRunner(Node):
         if not self._client.wait_for_server(timeout_sec=timeout):
             return {'status': 'server_unavailable'}
 
+        goal_x = float(goal.pose.pose.position.x)
+        goal_y = float(goal.pose.pose.position.y)
         started = time.time()
         send_future = self._client.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, send_future)
@@ -242,7 +296,34 @@ class InspectionRunner(Node):
             return {'status': 'rejected', 'duration_sec': round(time.time() - started, 3)}
 
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+        nav_timeout = float(self.get_parameter('nav_goal_timeout_sec').value)
+
+        def _cancel(reason: str) -> dict:
+            self.get_logger().warn(
+                'Cancelling nav goal (%.3f, %.3f): %s' % (goal_x, goal_y, reason))
+            cancel_future = goal_handle.cancel_goal_async()
+            rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=5.0)
+            return {'status': reason, 'duration_sec': round(time.time() - started, 3)}
+
+        last_blocked_check = 0.0
+        while rclpy.ok() and not result_future.done():
+            elapsed = time.time() - started
+            # Hard backstop: a goal Nav2 can never reach (recovery-cycling on
+            # an obstacle) would hang forever -- bound it. Sized well above the
+            # worst legitimate cross-map navigation so clear goals are never
+            # falsely cancelled; a real deadlock never completes either way.
+            if nav_timeout > 0.0 and elapsed > nav_timeout:
+                return _cancel('timeout')
+            # Mid-nav re-check (every ~2 s): once the robot is close enough to
+            # mark an obstacle sitting ON the target, the goal cell turns
+            # lethal -> cancel immediately instead of cycling recovery for the
+            # whole backstop. A clear long-distance goal stays clear and keeps
+            # navigating, so this never penalises normal (obstacle-free) runs.
+            if elapsed - last_blocked_check >= 2.0:
+                last_blocked_check = elapsed
+                if not self.candidate_is_clear(goal_x, goal_y):
+                    return _cancel('goal_blocked')
+            rclpy.spin_once(self, timeout_sec=0.1)
         result = result_future.result()
         status_text = STATUS_TEXT.get(result.status, str(result.status))
         return {
@@ -320,8 +401,27 @@ class InspectionRunner(Node):
 
         selected = None
         attempt_limit = int(self.get_parameter('max_candidate_attempts_per_area').value)
-        candidates_to_try = candidates if attempt_limit <= 0 else candidates[:attempt_limit]
-        for candidate in candidates_to_try:
+        attempts_made = 0
+        # A-axis hook: candidates an unmapped obstacle occupies in the costmap.
+        blocked_candidates = []
+        for candidate in candidates:
+            if attempt_limit > 0 and attempts_made >= attempt_limit:
+                break
+            # Refresh the costmap, then skip any candidate an obstacle occupies
+            # so we never aim the robot INTO an obstacle (no collision/hugging
+            # /center-on-obstacle deadlock). An obstacle discovered en route is
+            # caught here on the next iteration, after the failed attempt below
+            # has updated the costmap.
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if not self.candidate_is_clear(candidate['x'], candidate['y']):
+                self.get_logger().warn(
+                    '%s candidate %s (%.3f, %.3f) blocked in costmap '
+                    '(unmapped obstacle) -- skipping'
+                    % (area_key, candidate['label'], candidate['x'], candidate['y'])
+                )
+                blocked_candidates.append(dict(candidate))
+                continue
+            attempts_made += 1
             self.get_logger().info(
                 'Trying %s candidate %s x=%.3f y=%.3f'
                 % (area_key, candidate['label'], candidate['x'], candidate['y'])
@@ -336,18 +436,23 @@ class InspectionRunner(Node):
                 selected = candidate
                 break
 
+            # Let the costmap absorb whatever the robot sensed en route before
+            # the next candidate is re-validated against it.
+            rclpy.spin_once(self, timeout_sec=0.2)
             evidence = self.capture_nav_fail_evidence(area_key, area_dir, len(result['nav_attempts']))
             if evidence:
                 attempt['nav_fail_evidence'] = evidence
                 result['nav_fail_evidence'].append(evidence)
 
+        result['blocked_candidates'] = blocked_candidates
         if selected is None:
             result['status'] = 'nav_failed'
-            result['reason'] = (
-                'candidate_attempt_limit_reached'
-                if len(candidates_to_try) < len(candidates) else
-                'all_attempted_candidate_poses_failed'
-            )
+            if blocked_candidates and not result['nav_attempts']:
+                result['reason'] = 'all_candidates_blocked_by_unmapped_obstacle'
+            elif attempt_limit > 0 and attempts_made >= attempt_limit:
+                result['reason'] = 'candidate_attempt_limit_reached'
+            else:
+                result['reason'] = 'all_attempted_candidate_poses_failed'
             result['scan_summary'] = aggregate_scan_summaries([])
             return result
 
