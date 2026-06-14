@@ -363,24 +363,27 @@
       </inertial>
 
       <pose>0.076 0.0 0.093 0 0 0</pose>
-      <!-- ASUS Webcam C3 (tb3 / Robot B): mono RGB, 1080p@30fps fixed-focus.
-           Sim approximation: pinhole (NOT the old 182deg fisheye), 90 deg
-           horizontal FOV (team P1-5v calibration; ASUS publishes no exact
-           FOV value), 1280x720 @ 30 fps. -->
-      <sensor name="camera" type="camera">
+      <!-- Intel RealSense D436 (arm / Robot A): RGB-D global-shutter camera.
+           Real: depth FOV 87x58, RGB FOV 90x65, depth range 0.2-10m (ideal
+           0.3-3m), up to 1280x720. Sim: a single Gazebo depth sensor couples
+           depth+color FOV, so we use 87 deg horizontal (depth), 848x480 @
+           15 fps, clip 0.2-10m. Publishes RGB image_raw + depth/image_raw +
+           depth/points (the point cloud is the next-phase feed into the Nav2
+           voxel layer for sub-LiDAR obstacle coverage) + camera_info. -->
+      <sensor name="camera" type="depth">
         <always_on>true</always_on>
         <visualize>true</visualize>
-        <update_rate>30</update_rate>
-        <camera name="asus_c3">
-          <horizontal_fov>1.5708</horizontal_fov>
+        <update_rate>15</update_rate>
+        <camera name="realsense_d436">
+          <horizontal_fov>1.5184</horizontal_fov>
           <image>
-            <width>1280</width>
-            <height>720</height>
+            <width>848</width>
+            <height>480</height>
             <format>R8G8B8</format>
           </image>
           <clip>
-            <near>0.05</near>
-            <far>100</far>
+            <near>0.2</near>
+            <far>10.0</far>
           </clip>
           <noise>
             <type>gaussian</type>
@@ -390,11 +393,16 @@
         </camera>
         <plugin name="camera_driver" filename="libgazebo_ros_camera.so">
           <alwaysOn>true</alwaysOn>
-          <updateRate>30.0</updateRate>
+          <updateRate>15.0</updateRate>
           <cameraName>camera</cameraName>
-          <frameName>camera_link</frameName>
+          <frameName>camera_rgb_optical_frame</frameName>
           <imageTopicName>image_raw</imageTopicName>
           <cameraInfoTopicName>camera_info</cameraInfoTopicName>
+          <depthImageTopicName>depth/image_raw</depthImageTopicName>
+          <depthImageCameraInfoTopicName>depth/camera_info</depthImageCameraInfoTopicName>
+          <pointCloudTopicName>depth/points</pointCloudTopicName>
+          <pointCloudCutoff>0.2</pointCloudCutoff>
+          <pointCloudCutoffMax>10.0</pointCloudCutoffMax>
           <distortionK1>0.0</distortionK1>
           <distortionK2>0.0</distortionK2>
           <distortionK3>0.0</distortionK3>

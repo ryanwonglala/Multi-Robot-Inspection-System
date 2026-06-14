@@ -6,13 +6,18 @@ from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
-# Mid-term: Robot A's sim stand-in is also a burger_cam; the Final swaps in
-# the real mobile manipulator's model under the same 'arm' namespace.
+# Per-robot sim models match the real camera hardware:
+#   tb3 (Robot B) -> ASUS Webcam C3       : mono RGB        (burger_cam_ns)
+#   arm (Robot A) -> RealSense D436 depth : RGB-D + points  (burger_d436_ns)
+# The arm sim stand-in is still a burger chassis; the Final swaps in the real
+# mobile manipulator under the same 'arm' namespace, keeping the D436 model.
 ROBOTS = [
     # Docked face-to-wall on opposite sides of the mother_base corridor:
     # tb3 at the south-wall charging station, arm mirrored on the north wall.
-    {'ns': 'tb3', 'x': '-4.8', 'y': '-3.825', 'yaw': '-1.5708'},
-    {'ns': 'arm', 'x': '-4.8', 'y': '-2.95',  'yaw': '1.5708'},
+    {'ns': 'tb3', 'model': 'turtlebot3_burger_cam_ns',
+     'x': '-4.8', 'y': '-3.825', 'yaw': '-1.5708'},
+    {'ns': 'arm', 'model': 'turtlebot3_burger_d436_ns',
+     'x': '-4.8', 'y': '-2.95',  'yaw': '1.5708'},
 ]
 
 
@@ -23,12 +28,11 @@ def generate_launch_description():
 
     world = os.path.join(pkg_sim, 'worlds', 'map.world')
     urdf_path = os.path.join(tb3_gz_dir, 'urdf', 'turtlebot3_burger_cam.urdf')
-    # Namespaced SDF variant: identical to turtlebot3_gazebo's burger_cam
-    # except the diff_drive plugin remaps /tf:=tf so its odom TF stays inside
-    # the namespace injected by -robot_namespace (stock plugin publishes the
-    # TF on absolute /tf, which would mix both robots' odometry).
-    model_sdf_path = os.path.join(
-        pkg_sim, 'models', 'turtlebot3_burger_cam_ns', 'model.sdf')
+    # Each robot spawns from its own namespaced SDF (see ROBOTS['model']); both
+    # variants remap the diff_drive /tf:=tf so the odom TF stays inside the
+    # namespace injected by -robot_namespace. The two models differ only in the
+    # camera sensor block (C3 RGB vs D436 depth). The shared burger_cam URDF
+    # below provides the camera_link / camera_rgb_optical_frame for both.
     model_path = os.path.join(tb3_gz_dir, 'models')
 
     with open(urdf_path, 'r') as f:
@@ -69,7 +73,8 @@ def generate_launch_description():
             output='screen',
             arguments=[
                 '-entity', ns,
-                '-file', model_sdf_path,
+                '-file', os.path.join(
+                    pkg_sim, 'models', robot['model'], 'model.sdf'),
                 '-robot_namespace', ns,
                 '-x', robot['x'], '-y', robot['y'], '-z', '0.035',
                 '-Y', robot['yaw'],
