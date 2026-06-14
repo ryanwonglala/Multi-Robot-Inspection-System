@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from datetime import datetime
 import math
+import os
 from pathlib import Path
+import signal
 import subprocess
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -327,6 +330,8 @@ class TaskGui:
         buttons = ttk.Frame(right)
         buttons.pack(fill='x', pady=(10, 0))
         ttk.Button(buttons, text='Start Inspection', command=self.start_inspection).pack(side='left')
+        ttk.Button(buttons, text='Abort & Reset to Dock',
+                   command=self.abort_and_reset_to_dock).pack(side='left', padx=(8, 0))
         ttk.Button(buttons, text='Open Report Dir', command=self.set_report_dir_status).pack(side='left', padx=(8, 0))
 
         report = ttk.LabelFrame(right, text='Inspection Status')
@@ -512,8 +517,11 @@ class TaskGui:
         ]
         try:
             log_file = open(log_path, 'w', encoding='utf-8')
+            # start_new_session: own process group, so Abort can kill the
+            # allocator AND the runner subprocesses it spawns (os.killpg).
             self.inspect_processes['__auto__'] = subprocess.Popen(
-                command, stdout=log_file, stderr=subprocess.STDOUT, text=True)
+                command, stdout=log_file, stderr=subprocess.STDOUT, text=True,
+                start_new_session=True)
             self.inspect_logs['__auto__'] = (log_file, log_path)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror('Inspection Error', str(exc))
@@ -557,7 +565,8 @@ class TaskGui:
         try:
             log_file = open(log_path, 'w', encoding='utf-8')
             self.inspect_processes[ns] = subprocess.Popen(
-                command, stdout=log_file, stderr=subprocess.STDOUT, text=True)
+                command, stdout=log_file, stderr=subprocess.STDOUT, text=True,
+                start_new_session=True)
             self.inspect_logs[ns] = (log_file, log_path)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror('Inspection Error', str(exc))
@@ -694,10 +703,92 @@ class TaskGui:
         self.node.active_robot = '' if value == '(root)' else value
         self.status_var.set(f'Active robot: {value}')
 
+    def _kill_process_group(self, process) -> None:
+        """SIGINT the whole process group (allocator + its runner children),
+        escalating to SIGKILL if it does not exit promptly."""
+        if not process or process.poll() is not None:
+            return
+        try:
+            pgid = os.getpgid(process.pid)
+        except (ProcessLookupError, OSError):
+            return
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, OSError):
+                return
+            try:
+                process.wait(timeout=3.0)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+
+    def _latest_run_dir(self) -> Path | None:
+        """Newest mission_*/inspection_* directory under report_dir, to drop an
+        abort marker into the run we just killed."""
+        root = Path(self.node.get_parameter('report_dir').value)
+        if not root.exists():
+            return None
+        candidates = [p for p in root.glob('**/mission_*') if p.is_dir()]
+        candidates += [p for p in root.glob('**/inspection_*') if p.is_dir()]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    def abort_and_reset_to_dock(self):
+        """Abandon the running inspection and hard-reset every robot to its dock
+        (teleport + re-seed AMCL + clear costmaps). Recovers from wedge / loop /
+        AMCL drift without restarting the stack. SIMULATION ONLY."""
+        running = [p for p in self.inspect_processes.values()
+                   if p and p.poll() is None]
+        if not messagebox.askyesno(
+                'Abort & Reset',
+                'Abandon the current inspection (if any) and hard-reset all '
+                'robots to their docks?\n\n(Teleport + relocalise + clear '
+                'costmaps. Simulation only.)'):
+            return
+
+        # 1. Kill the running inspection process group(s).
+        for process in running:
+            self._kill_process_group(process)
+        self.inspect_processes.clear()
+
+        # 2. Mark the interrupted run as aborted (do not fake a full report).
+        run_dir = self._latest_run_dir()
+        if run_dir is not None:
+            try:
+                stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                (run_dir / 'ABORTED.txt').write_text(
+                    f'Mission manually aborted at {stamp} via GUI '
+                    '"Abort & Reset to Dock".\n'
+                    'Robots were teleported back to their docks; this run is '
+                    'INCOMPLETE -- any partial photos/yaml here are not a valid '
+                    'inspection result.\n', encoding='utf-8')
+            except OSError:
+                pass
+
+        # 3. Hard-reset every robot to its dock.
+        report_root = Path(self.node.get_parameter('report_dir').value)
+        report_root.mkdir(parents=True, exist_ok=True)
+        log_path = report_root / 'reset_to_dock_last_run.log'
+        command = [
+            'ros2', 'run', 'task_layer', 'reset_to_dock.py', '--ros-args',
+            '-p', f'use_sim_time:={str(bool(self.node.get_parameter("use_sim_time").value)).lower()}',
+        ]
+        try:
+            log_file = open(log_path, 'w', encoding='utf-8')
+            subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT,
+                             text=True, start_new_session=True)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror('Reset Error', str(exc))
+            return
+        marked = f' (marked {run_dir.name} aborted)' if run_dir is not None else ''
+        self.inspect_status_var.set(
+            f'Aborted; resetting all robots to docks…{marked}')
+
     def close(self):
         for process in self.inspect_processes.values():
-            if process and process.poll() is None:
-                process.terminate()
+            self._kill_process_group(process)
         self.root.destroy()
 
     def run(self):

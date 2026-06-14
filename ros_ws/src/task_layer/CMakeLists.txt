@@ -19,6 +19,7 @@ install(PROGRAMS
   task_layer/set_initial_pose_node.py
   task_layer/go_to_area_node.py
   task_layer/inspection_runner.py
+  task_layer/reset_to_dock.py
   task_layer/task_gui_node.py
   task_layer/model_spawner.py
   task_layer/scan_analyzer.py
