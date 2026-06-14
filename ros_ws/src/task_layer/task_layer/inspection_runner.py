@@ -11,8 +11,10 @@ from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image, LaserScan
 import yaml
 
@@ -66,7 +68,7 @@ class InspectionRunner(Node):
         self.declare_parameter('candidate_offset', 0.5)
         self.declare_parameter('candidate_spread_ratio', 0.35)
         self.declare_parameter('bounds_margin', 0.25)
-        self.declare_parameter('max_candidate_attempts_per_area', 2)
+        self.declare_parameter('max_candidate_attempts_per_area', 4)
         self.declare_parameter('capture_nav_fail_evidence', True)
         self.declare_parameter('scan_yaws', [0.0, 1.5708, 3.1416, -1.5708])
         self.declare_parameter('scan_settle_sec', 1.0)
@@ -83,22 +85,128 @@ class InspectionRunner(Node):
         self.declare_parameter('home_yaw', 0.0)
         self.declare_parameter('return_home_standoff_distance', 0.0)
         self.declare_parameter('dry_run', False)
+        # --- Navigation resilience (B-axis): never collide/hug/deadlock; a
+        # blocked area is skipped gracefully so the mission always completes.
+        # The global-costmap query here is also the shared foundation the
+        # A-axis (anomaly detection) reuses to flag unmapped obstacles.
+        self.declare_parameter('costmap_topic', 'global_costmap/costmap')
+        self.declare_parameter('static_map_topic', 'map')
+        # Only TRUE lethal cells (LETHAL_OBSTACLE -> 100 in the OccupancyGrid)
+        # count: inscribed (99) and the inflation gradient bleed into FREE
+        # static-map cells around walls, so a lower threshold would falsely flag
+        # legitimate wall-adjacent goals. 100 keeps only an obstacle's actual
+        # footprint (and wall cells, which the static-map check then excludes).
+        self.declare_parameter('costmap_lethal_cost', 100)
+        # Static-map occupancy below this (and >= 0) is "free floor". Used to
+        # tell a dynamic/unmapped obstacle (lethal in costmap, free on the map)
+        # from a static wall (lethal in costmap, occupied on the map).
+        self.declare_parameter('static_free_max', 50)
+        self.declare_parameter('candidate_clearance_radius', 0.22)
+        self.declare_parameter('nav_goal_timeout_sec', 120.0)
 
         action_name = self.get_parameter('action_name').value
         self._client = ActionClient(self, NavigateToPose, action_name)
         self._latest_scan = None
         self._latest_image = None
+        self._latest_costmap = None
+        self._latest_static_map = None
         self._run_dir = None
+        # Set True once a nav goal cannot be confirmed terminal (cancel not
+        # confirmed, or a send timed out with a possibly-pending request). While
+        # set, NO further nav goal is dispatched -- commanding a new goal while a
+        # previous one may still be live server-side is unsafe (preempt race).
+        self._nav_aborted = False
         scan_topic = self.get_parameter('scan_topic').value
         image_topic = self.get_parameter('image_topic').value
         self.create_subscription(LaserScan, scan_topic, self._scan_callback, 10)
         self.create_subscription(Image, image_topic, self._image_callback, 10)
+        # The global costmap is latched (transient_local); QoS must match or
+        # the subscription receives nothing.
+        costmap_qos = QoSProfile(depth=1)
+        costmap_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        costmap_qos.reliability = QoSReliabilityPolicy.RELIABLE
+        self.create_subscription(
+            OccupancyGrid, self.get_parameter('costmap_topic').value,
+            self._costmap_callback, costmap_qos)
+        # Static map (also latched) -- lets candidate_is_clear separate dynamic
+        # obstacles from the known walls baked into the costmap.
+        self.create_subscription(
+            OccupancyGrid, self.get_parameter('static_map_topic').value,
+            self._static_map_callback, costmap_qos)
 
     def _scan_callback(self, msg: LaserScan):
         self._latest_scan = msg
 
     def _image_callback(self, msg: Image):
         self._latest_image = msg
+
+    def _costmap_callback(self, msg: OccupancyGrid):
+        self._latest_costmap = msg
+
+    def _static_map_callback(self, msg: OccupancyGrid):
+        self._latest_static_map = msg
+
+    @staticmethod
+    def _grid_value(grid: OccupancyGrid, x: float, y: float):
+        """Occupancy/cost at world (x, y) in an OccupancyGrid, or None if the
+        grid is missing or the point falls outside it."""
+        if grid is None:
+            return None
+        info = grid.info
+        if info.resolution <= 0.0:
+            return None
+        col = math.floor((x - info.origin.position.x) / info.resolution)
+        row = math.floor((y - info.origin.position.y) / info.resolution)
+        if 0 <= col < info.width and 0 <= row < info.height:
+            return grid.data[row * info.width + col]
+        return None
+
+    def candidate_is_clear(self, x: float, y: float) -> bool:
+        """False only when an UNMAPPED (dynamic) obstacle occupies the candidate
+        footprint -- i.e. a costmap cell at lethal cost whose location is FREE
+        on the static map.
+
+        Static walls are lethal in the costmap too, but the static map marks
+        them occupied, so they are deliberately NOT treated as blocking; their
+        inflation gradient is excluded by the lethal>=100 threshold. This is
+        what keeps legitimate wall-adjacent goals (the charging dock, doorway
+        viewpoints) from being falsely cancelled. The False signal -- lethal
+        cost over free static-map floor -- is exactly the unmapped-obstacle
+        event the A-axis will publish as an anomaly; B only uses it to pick a
+        reachable standoff pose.
+
+        No costmap or no static map yet / out of map => optimistic True: let
+        Nav2 try, with the per-goal timeout in send_goal_and_wait as the
+        universal backstop."""
+        grid = self._latest_costmap
+        static = self._latest_static_map
+        if grid is None or static is None:
+            return True
+        info = grid.info
+        if info.resolution <= 0.0:
+            return True
+        lethal = int(self.get_parameter('costmap_lethal_cost').value)
+        free_max = int(self.get_parameter('static_free_max').value)
+        radius = float(self.get_parameter('candidate_clearance_radius').value)
+        steps = max(0, int(radius / info.resolution))
+        base_col = math.floor((x - info.origin.position.x) / info.resolution)
+        base_row = math.floor((y - info.origin.position.y) / info.resolution)
+        for d_row in range(-steps, steps + 1):
+            for d_col in range(-steps, steps + 1):
+                col = base_col + d_col
+                row = base_row + d_row
+                if not (0 <= col < info.width and 0 <= row < info.height):
+                    continue
+                if grid.data[row * info.width + col] < lethal:
+                    continue
+                # Lethal in the costmap. Only count it as a dynamic obstacle if
+                # the static map does NOT explain it (free floor at that spot).
+                wx = info.origin.position.x + (col + 0.5) * info.resolution
+                wy = info.origin.position.y + (row + 0.5) * info.resolution
+                static_val = self._grid_value(static, wx, wy)
+                if static_val is not None and 0 <= static_val < free_max:
+                    return False
+        return True
 
     def load_world_model(self) -> dict:
         path = Path(self.get_parameter('world_model_path').value).expanduser()
@@ -229,24 +337,138 @@ class InspectionRunner(Node):
         goal.pose = pose
         return goal
 
+    def _await_terminal(self, result_future, deadline_sec: float) -> bool:
+        """Spin until the goal's result_future reaches a terminal state or the
+        deadline elapses. Returns True iff terminal was confirmed."""
+        deadline = time.time() + deadline_sec
+        while rclpy.ok() and not result_future.done() and time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        return result_future.done()
+
+    def _finish(self, result: dict) -> dict:
+        """Tag a nav result and, if it could NOT be confirmed terminal, latch
+        the mission-wide abort so no further goal is dispatched."""
+        if not result.get('safe_to_continue', True):
+            self._nav_aborted = True
+            self.get_logger().error(
+                'Nav goal left in an unconfirmed state (%s) -- aborting further '
+                'navigation to avoid a preempt race.' % result.get('status'))
+        return result
+
     def send_goal_and_wait(self, goal: NavigateToPose.Goal) -> dict:
         timeout = float(self.get_parameter('server_timeout_sec').value)
         if not self._client.wait_for_server(timeout_sec=timeout):
-            return {'status': 'server_unavailable'}
+            # No goal was sent -> the server is executing nothing -> safe.
+            return self._finish({'status': 'server_unavailable', 'safe_to_continue': True})
 
+        goal_x = float(goal.pose.pose.position.x)
+        goal_y = float(goal.pose.pose.position.y)
         started = time.time()
         send_future = self._client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, send_future)
+        # Bound the goal-request phase too: a server that accepts connections
+        # but never answers send_goal would otherwise hang the mission forever.
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=timeout)
+        if not send_future.done():
+            return self._finish(self._handle_send_timeout(send_future, goal_x, goal_y, started))
         goal_handle = send_future.result()
         if goal_handle is None or not goal_handle.accepted:
-            return {'status': 'rejected', 'duration_sec': round(time.time() - started, 3)}
+            # Not accepted -> server is executing nothing -> safe to continue.
+            return self._finish({'status': 'rejected', 'safe_to_continue': True,
+                                 'duration_sec': round(time.time() - started, 3)})
 
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+        nav_timeout = float(self.get_parameter('nav_goal_timeout_sec').value)
+
+        def _cancel(reason: str) -> dict:
+            self.get_logger().warn(
+                'Cancelling nav goal (%.3f, %.3f): %s' % (goal_x, goal_y, reason))
+            cancel_future = goal_handle.cancel_goal_async()
+            rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=5.0)
+            # Did the server actually accept the cancel (vs the goal finishing
+            # on its own)? goals_canceling is non-empty only when accepted.
+            cancel_accepted = bool(
+                cancel_future.done() and cancel_future.result() is not None
+                and len(cancel_future.result().goals_canceling) > 0)
+            # Wait (bounded) for the goal to actually reach a terminal state.
+            # Only once it is terminal is it safe to dispatch the next goal.
+            terminal = self._await_terminal(result_future, 5.0)
+            out = {
+                'status': reason,
+                'cancel_accepted': cancel_accepted,
+                'cancel_terminal': 'confirmed' if terminal else 'unconfirmed',
+                'safe_to_continue': terminal,
+                'duration_sec': round(time.time() - started, 3),
+            }
+            if terminal:
+                # If the goal actually completed on its own, surface the true
+                # outcome instead of pretending the cancel reason was the cause.
+                res = result_future.result()
+                if res is not None:
+                    out['final_nav_status'] = STATUS_TEXT.get(res.status, str(res.status))
+            return out
+
+        last_blocked_check = 0.0
+        while rclpy.ok() and not result_future.done():
+            elapsed = time.time() - started
+            # Hard backstop: a goal Nav2 can never reach (recovery-cycling on
+            # an obstacle) would hang forever -- bound it. Sized well above the
+            # worst legitimate cross-map navigation so clear goals are never
+            # falsely cancelled; a real deadlock never completes either way.
+            if nav_timeout > 0.0 and elapsed > nav_timeout:
+                return self._finish(_cancel('timeout'))
+            # Mid-nav re-check (every ~2 s): once the robot is close enough to
+            # mark an obstacle sitting ON the target, the goal cell turns
+            # lethal -> cancel immediately instead of cycling recovery for the
+            # whole backstop. A clear long-distance goal stays clear and keeps
+            # navigating, so this never penalises normal (obstacle-free) runs.
+            if elapsed - last_blocked_check >= 2.0:
+                last_blocked_check = elapsed
+                if not self.candidate_is_clear(goal_x, goal_y):
+                    return self._finish(_cancel('goal_blocked'))
+            rclpy.spin_once(self, timeout_sec=0.1)
         result = result_future.result()
         status_text = STATUS_TEXT.get(result.status, str(result.status))
-        return {
+        return self._finish({
             'status': status_text,
+            'safe_to_continue': True,
+            'duration_sec': round(time.time() - started, 3),
+        })
+
+    def _handle_send_timeout(self, send_future, goal_x: float, goal_y: float,
+                             started: float) -> dict:
+        """A send_goal request did not get a response in time. The request may
+        still be pending inside rclpy; if the server later accepts it the goal
+        runs UNMANAGED. Give the response a bounded second chance: if a handle
+        arrives accepted, cancel it and confirm terminal; only if we can prove
+        nothing is (or will be) executing is it safe to continue."""
+        extra = float(self.get_parameter('server_timeout_sec').value)
+        deadline = time.time() + extra
+        while rclpy.ok() and not send_future.done() and time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if not send_future.done():
+            # Still no response -- the request may yet be accepted server-side.
+            # Stop the client from acting on a late response and fail safe.
+            try:
+                send_future.cancel()
+            except Exception:
+                pass
+            return {'status': 'send_timeout', 'safe_to_continue': False,
+                    'duration_sec': round(time.time() - started, 3)}
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            return {'status': 'send_timeout_rejected', 'safe_to_continue': True,
+                    'duration_sec': round(time.time() - started, 3)}
+        self.get_logger().warn(
+            'Late goal accept after send_timeout (%.3f, %.3f) -- cancelling'
+            % (goal_x, goal_y))
+        result_future = goal_handle.get_result_async()
+        cancel_future = goal_handle.cancel_goal_async()
+        rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=5.0)
+        terminal = self._await_terminal(result_future, 5.0)
+        return {
+            'status': 'send_timeout_cancelled',
+            'cancel_terminal': 'confirmed' if terminal else 'unconfirmed',
+            'safe_to_continue': terminal,
             'duration_sec': round(time.time() - started, 3),
         }
 
@@ -318,10 +540,35 @@ class InspectionRunner(Node):
             result['scan_summary'] = aggregate_scan_summaries([])
             return result
 
+        if self._nav_aborted:
+            result['status'] = 'nav_aborted'
+            result['reason'] = 'prior_nav_goal_unconfirmed'
+            result['scan_summary'] = aggregate_scan_summaries([])
+            return result
+
         selected = None
         attempt_limit = int(self.get_parameter('max_candidate_attempts_per_area').value)
-        candidates_to_try = candidates if attempt_limit <= 0 else candidates[:attempt_limit]
-        for candidate in candidates_to_try:
+        attempts_made = 0
+        # A-axis hook: candidates an unmapped obstacle occupies in the costmap.
+        blocked_candidates = []
+        for candidate in candidates:
+            if attempt_limit > 0 and attempts_made >= attempt_limit:
+                break
+            # Refresh the costmap, then skip any candidate an obstacle occupies
+            # so we never aim the robot INTO an obstacle (no collision/hugging
+            # /center-on-obstacle deadlock). An obstacle discovered en route is
+            # caught here on the next iteration, after the failed attempt below
+            # has updated the costmap.
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if not self.candidate_is_clear(candidate['x'], candidate['y']):
+                self.get_logger().warn(
+                    '%s candidate %s (%.3f, %.3f) blocked in costmap '
+                    '(unmapped obstacle) -- skipping'
+                    % (area_key, candidate['label'], candidate['x'], candidate['y'])
+                )
+                blocked_candidates.append(dict(candidate))
+                continue
+            attempts_made += 1
             self.get_logger().info(
                 'Trying %s candidate %s x=%.3f y=%.3f'
                 % (area_key, candidate['label'], candidate['x'], candidate['y'])
@@ -336,18 +583,33 @@ class InspectionRunner(Node):
                 selected = candidate
                 break
 
+            # An unconfirmed-terminal goal makes any further dispatch unsafe:
+            # stop trying candidates rather than racing a possibly-live goal.
+            if self._nav_aborted:
+                break
+
+            # Let the costmap absorb whatever the robot sensed en route before
+            # the next candidate is re-validated against it.
+            rclpy.spin_once(self, timeout_sec=0.2)
             evidence = self.capture_nav_fail_evidence(area_key, area_dir, len(result['nav_attempts']))
             if evidence:
                 attempt['nav_fail_evidence'] = evidence
                 result['nav_fail_evidence'].append(evidence)
 
+        result['blocked_candidates'] = blocked_candidates
         if selected is None:
+            if self._nav_aborted:
+                result['status'] = 'nav_aborted'
+                result['reason'] = 'nav_goal_unconfirmed_terminal'
+                result['scan_summary'] = aggregate_scan_summaries([])
+                return result
             result['status'] = 'nav_failed'
-            result['reason'] = (
-                'candidate_attempt_limit_reached'
-                if len(candidates_to_try) < len(candidates) else
-                'all_attempted_candidate_poses_failed'
-            )
+            if blocked_candidates and not result['nav_attempts']:
+                result['reason'] = 'all_candidates_blocked_by_unmapped_obstacle'
+            elif attempt_limit > 0 and attempts_made >= attempt_limit:
+                result['reason'] = 'candidate_attempt_limit_reached'
+            else:
+                result['reason'] = 'all_attempted_candidate_poses_failed'
             result['scan_summary'] = aggregate_scan_summaries([])
             return result
 
@@ -363,6 +625,13 @@ class InspectionRunner(Node):
                 index,
             )
             result['scan_samples'].append(sample)
+            # A turn-in-place goal that we could not confirm terminal aborts the
+            # rest of the sweep (and the mission) for the same safety reason.
+            if self._nav_aborted:
+                result['scan_summary'] = aggregate_scan_summaries(result['scan_samples'])
+                result['status'] = 'nav_aborted'
+                result['reason'] = 'nav_goal_unconfirmed_terminal_during_scan'
+                return result
 
         result['scan_summary'] = aggregate_scan_summaries(result['scan_samples'])
         result['status'] = 'checked'
@@ -457,6 +726,12 @@ class InspectionRunner(Node):
             result['dock_pose'] = pose['dock_pose']
         if dry_run:
             result['result'] = {'status': 'dry_run'}
+            return result
+
+        if self._nav_aborted:
+            # A prior goal could not be confirmed terminal -- do not command the
+            # robot home on top of a possibly-live goal.
+            result['result'] = {'status': 'skipped_nav_aborted', 'safe_to_continue': False}
             return result
 
         self.get_logger().info(
@@ -565,10 +840,12 @@ class InspectionRunner(Node):
         checked = [area for area in report['areas'] if area.get('status') == 'checked']
         failed = [area for area in report['areas'] if area.get('status') == 'nav_failed']
         unchecked = [area for area in report['areas'] if area.get('status') == 'unchecked']
+        aborted = [area for area in report['areas'] if area.get('status') == 'nav_aborted']
         report['summary'].update({
             'checked_count': len(checked),
             'failed_count': len(failed),
             'unchecked_count': len(unchecked),
+            'aborted_count': len(aborted),
         })
 
         report['return_home'] = self.return_home_result(world_model, dry_run)
@@ -576,6 +853,10 @@ class InspectionRunner(Node):
 
         if dry_run:
             report['status'] = 'dry_run'
+        elif self._nav_aborted:
+            # A nav goal could not be confirmed terminal; the mission was stopped
+            # rather than risk commanding the robot on top of a live goal.
+            report['status'] = 'aborted_unsafe_nav_state'
         elif return_status not in {'succeeded', 'disabled'}:
             report['status'] = 'completed_return_failed'
         elif failed or unchecked:
