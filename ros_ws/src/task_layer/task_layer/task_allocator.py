@@ -45,6 +45,13 @@ class TaskAllocator(Node):
         self.declare_parameter('report_dir', default_report_dir())
         self.declare_parameter('pose_wait_sec', 5.0)
         self.declare_parameter('return_home', True)
+        # Per-robot bound on the return-home drive: a robot whose dock/funnel is
+        # blocked gives up gracefully and frees the gate instead of wedging.
+        self.declare_parameter('return_timeout_sec', 150.0)
+        # Overall safety net for the whole post-launch phase (runners are
+        # individually bounded by their own B-axis logic, so this only guards
+        # against a pathological hang).
+        self.declare_parameter('mission_backstop_sec', 1800.0)
         try:
             self.declare_parameter('use_sim_time', True)
         except rclpy.exceptions.ParameterAlreadyDeclaredException:
@@ -207,9 +214,9 @@ class TaskAllocator(Node):
             report_dir = mission_dir / ns
             report_dir.mkdir(parents=True, exist_ok=True)
             # Runners never return home on their own: the allocator owns the
-            # end-of-mission return so it can arbitrate the shared doorway
-            # into the mother_base bay (unmanaged simultaneous returns wedged
-            # each other in that opening). See return_all_home().
+            # return so it can arbitrate the shared doorway into the mother_base
+            # bay (unmanaged simultaneous returns wedged each other there). Each
+            # robot is sent home the instant it finishes. See run_until_all_home().
             command = [
                 'ros2', 'run', 'task_layer', 'inspection_runner.py', '--ros-args',
                 '-r', f'__ns:=/{ns}',
@@ -229,18 +236,13 @@ class TaskAllocator(Node):
             if index < len(launch_order) - 1:
                 self.wait_departed(ns)
 
-        codes = {}
-        for ns, (process, log_file) in procs.items():
-            codes[ns] = process.wait()
-            log_file.close()
-            self.get_logger().info(f'{ns}: finished with code {codes[ns]}')
-
-        return_results: dict[str, bool] = {}
-        if bool(self.get_parameter('return_home').value):
-            return_results = self.return_all_home(list(procs))
-            for ns, ok in return_results.items():
-                if not ok:
-                    codes[ns] = codes.get(ns) or 6
+        # Early return: the moment a robot finishes its route it heads home
+        # (no waiting for peers); a gate mutex serialises the mother_base funnel
+        # for whoever is returning at once. See run_until_all_home().
+        codes, return_results = self.run_until_all_home(procs)
+        for ns, ok in return_results.items():
+            if not ok:
+                codes[ns] = codes.get(ns) or 6
 
         report_path = self.write_mission_report(
             mission_dir, route, plan, codes, return_results, started_at)
@@ -393,56 +395,84 @@ class TaskAllocator(Node):
         state['result_future'] = handle.get_result_async()
         state['state'] = 'driving'
 
-    def return_all_home(self, ns_list: list[str],
-                        timeout_sec: float = 300.0) -> dict[str, bool]:
-        """Concurrent return with a doorway mutex: every robot drives home at
-        once, but only one at a time may thread the funnel into the
-        mother_base bay (simultaneous unmanaged returns wedged there). A
-        robot approaching a held gate is cancelled in place and re-sent once
-        the holder has cleared the zone."""
+    def _begin_return(self, ns: str, st: dict):
+        """A robot has just finished its route: send it home, or mark it done if
+        return is disabled / it has no dock."""
+        if not bool(self.get_parameter('return_home').value):
+            st['state'] = 'done'
+            return
+        home = self.robots[ns].get('home_pose') or {}
+        if not {'x', 'y'} <= home.keys():
+            self.get_logger().warn(f'{ns}: no home_pose in robots.yaml, skipping return')
+            st['state'] = 'done'
+            return
+        st['return_attempted'] = True
+        client = ActionClient(self, NavigateToPose, self.robots[ns]['nav_action'])
+        if not client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error(f'{ns}: nav action server unavailable for return')
+            st['state'] = 'failed'
+            return
+        st['client'] = client
+        st['return_deadline'] = time.time() + float(
+            self.get_parameter('return_timeout_sec').value)
+        self.get_logger().info(
+            f"{ns}: route done, returning home x={home['x']} y={home['y']}")
+        self._start_home(ns, st)  # sends goal, sets state 'driving' or 'failed'
+
+    def run_until_all_home(self, procs: dict) -> tuple[dict, dict]:
+        """Unified post-launch scheduler. Polls each runner; the instant a robot
+        finishes its route it is sent home (EARLY return -- no waiting for
+        peers). A single doorway mutex serialises the mother_base funnel for
+        whoever is returning concurrently: only one threads the gate at a time;
+        another approaching it is cancelled in place and re-sent once the holder
+        clears. Each return is bounded by return_timeout_sec so a blocked dock
+        gives up gracefully and frees the gate instead of wedging the mission."""
         gate_x = float(self.home_gate.get('x', -1.65))
         gate_y = float(self.home_gate.get('y', -3.3))
         gate_radius = float(self.home_gate.get('radius', 1.0))
         hold_radius = gate_radius + 0.7  # stop before physically entering
+        backstop = time.time() + float(self.get_parameter('mission_backstop_sec').value)
 
-        states: dict[str, dict] = {}
-        for ns in ns_list:
-            home = self.robots[ns].get('home_pose') or {}
-            if not {'x', 'y'} <= home.keys():
-                self.get_logger().warn(
-                    f'{ns}: no home_pose in robots.yaml, skipping return')
-                continue
-            client = ActionClient(self, NavigateToPose, self.robots[ns]['nav_action'])
-            if not client.wait_for_server(timeout_sec=10.0):
-                self.get_logger().error(f'{ns}: nav action server unavailable for return')
-                states[ns] = {'state': 'failed', 'handle': None}
-                continue
-            states[ns] = {'client': client, 'state': 'init',
-                          'handle': None, 'result_future': None}
-            self.get_logger().info(
-                f"{ns}: returning home x={home['x']} y={home['y']}")
-            self._start_home(ns, states[ns])
+        codes: dict = {}
+        states = {ns: {'state': 'inspecting', 'client': None, 'handle': None,
+                       'result_future': None, 'return_deadline': None,
+                       'return_attempted': False}
+                  for ns in procs}
 
         def gate_dist(ns: str) -> float:
             px, py = self.robot_poses.get(ns, (math.inf, math.inf))
             return math.hypot(px - gate_x, py - gate_y)
 
         def past_gate(ns: str) -> bool:
-            # Already closer to its dock than the gate is: it has threaded
-            # the funnel and must not be held on the inside (observed: a
-            # robot paused pointlessly in the bay right after passing).
-            home = self.robots[ns]['home_pose']
+            # Already closer to its dock than the gate is -> it has threaded the
+            # funnel and must not be held on the inside.
+            home = self.robots[ns].get('home_pose') or {}
+            if not {'x', 'y'} <= home.keys():
+                return True
             hx, hy = float(home['x']), float(home['y'])
             px, py = self.robot_poses.get(ns, (math.inf, math.inf))
             return math.hypot(px - hx, py - hy) < math.hypot(gate_x - hx, gate_y - hy)
 
         holder = None
-        deadline = time.time() + timeout_sec
-        while (time.time() < deadline
-               and any(s['state'] in ('driving', 'held') for s in states.values())):
+        while time.time() < backstop:
             rclpy.spin_once(self, timeout_sec=0.1)
+
+            # (a) Runner still inspecting: dispatch it home the instant it exits.
+            for ns, (process, log_file) in procs.items():
+                if states[ns]['state'] == 'inspecting' and process.poll() is not None:
+                    codes[ns] = process.returncode
+                    try:
+                        log_file.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self.get_logger().info(f'{ns}: finished with code {codes[ns]}')
+                    self._begin_return(ns, states[ns])
+
+            # (b) Advance active returns: terminal result, or per-robot timeout.
             for ns, st in states.items():
-                if st['state'] == 'driving' and st['result_future'].done():
+                if st['state'] != 'driving':
+                    continue
+                if st['result_future'] is not None and st['result_future'].done():
                     result = st['result_future'].result()
                     if result is not None and result.status == 4:  # SUCCEEDED
                         st['state'] = 'done'
@@ -452,7 +482,13 @@ class TaskAllocator(Node):
                         status = getattr(result, 'status', 'no result')
                         self.get_logger().error(
                             f'{ns}: return home failed (status {status})')
-            # The holder keeps the gate while it is inside and still driving.
+                elif st['return_deadline'] and time.time() > st['return_deadline']:
+                    self.get_logger().error(f'{ns}: return home timed out, giving up')
+                    if st['handle'] is not None:
+                        st['handle'].cancel_goal_async()
+                    st['state'] = 'failed'
+
+            # (c) Doorway mutex across whoever is returning right now.
             if holder is not None and (states[holder]['state'] != 'driving'
                                        or gate_dist(holder) > gate_radius):
                 holder = None
@@ -466,19 +502,42 @@ class TaskAllocator(Node):
                     continue
                 if (holder is not None and st['state'] == 'driving'
                         and gate_dist(ns) <= hold_radius and not past_gate(ns)):
-                    st['handle'].cancel_goal_async()
+                    if st['handle'] is not None:
+                        st['handle'].cancel_goal_async()
                     st['state'] = 'held'
                     self.get_logger().info(
                         f'{ns}: holding before home gate ({holder} is inside)')
                 elif holder is None and st['state'] == 'held':
                     self.get_logger().info(f'{ns}: gate clear, resuming return')
                     self._start_home(ns, st)
-        for ns, st in states.items():
+
+            # (d) Done once every robot has returned (or failed / was skipped).
+            if all(st['state'] in ('done', 'failed') for st in states.values()):
+                break
+
+        # Backstop hit: reap/cancel anything still outstanding.
+        for ns, (process, log_file) in procs.items():
+            st = states[ns]
+            if st['state'] == 'inspecting':
+                self.get_logger().error(f'{ns}: runner did not finish (mission backstop)')
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    log_file.close()
+                except Exception:  # noqa: BLE001
+                    pass
             if st['state'] in ('driving', 'held'):
-                self.get_logger().error(f'{ns}: return home timed out')
+                self.get_logger().error(f'{ns}: return home timed out (mission backstop)')
                 if st.get('handle') is not None:
                     st['handle'].cancel_goal_async()
-        return {ns: st['state'] == 'done' for ns, st in states.items()}
+                st['state'] = 'failed'
+
+        for ns, (process, _log_file) in procs.items():
+            codes.setdefault(
+                ns, process.poll() if process.poll() is not None else 6)
+        return_results = {ns: st['state'] == 'done'
+                          for ns, st in states.items() if st['return_attempted']}
+        return codes, return_results
 
 
 def main(args=None):
