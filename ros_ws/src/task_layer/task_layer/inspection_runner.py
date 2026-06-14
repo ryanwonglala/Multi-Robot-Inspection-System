@@ -111,6 +111,11 @@ class InspectionRunner(Node):
         self._latest_costmap = None
         self._latest_static_map = None
         self._run_dir = None
+        # Set True once a nav goal cannot be confirmed terminal (cancel not
+        # confirmed, or a send timed out with a possibly-pending request). While
+        # set, NO further nav goal is dispatched -- commanding a new goal while a
+        # previous one may still be live server-side is unsafe (preempt race).
+        self._nav_aborted = False
         scan_topic = self.get_parameter('scan_topic').value
         image_topic = self.get_parameter('image_topic').value
         self.create_subscription(LaserScan, scan_topic, self._scan_callback, 10)
@@ -332,10 +337,29 @@ class InspectionRunner(Node):
         goal.pose = pose
         return goal
 
+    def _await_terminal(self, result_future, deadline_sec: float) -> bool:
+        """Spin until the goal's result_future reaches a terminal state or the
+        deadline elapses. Returns True iff terminal was confirmed."""
+        deadline = time.time() + deadline_sec
+        while rclpy.ok() and not result_future.done() and time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        return result_future.done()
+
+    def _finish(self, result: dict) -> dict:
+        """Tag a nav result and, if it could NOT be confirmed terminal, latch
+        the mission-wide abort so no further goal is dispatched."""
+        if not result.get('safe_to_continue', True):
+            self._nav_aborted = True
+            self.get_logger().error(
+                'Nav goal left in an unconfirmed state (%s) -- aborting further '
+                'navigation to avoid a preempt race.' % result.get('status'))
+        return result
+
     def send_goal_and_wait(self, goal: NavigateToPose.Goal) -> dict:
         timeout = float(self.get_parameter('server_timeout_sec').value)
         if not self._client.wait_for_server(timeout_sec=timeout):
-            return {'status': 'server_unavailable'}
+            # No goal was sent -> the server is executing nothing -> safe.
+            return self._finish({'status': 'server_unavailable', 'safe_to_continue': True})
 
         goal_x = float(goal.pose.pose.position.x)
         goal_y = float(goal.pose.pose.position.y)
@@ -345,10 +369,12 @@ class InspectionRunner(Node):
         # but never answers send_goal would otherwise hang the mission forever.
         rclpy.spin_until_future_complete(self, send_future, timeout_sec=timeout)
         if not send_future.done():
-            return {'status': 'send_timeout', 'duration_sec': round(time.time() - started, 3)}
+            return self._finish(self._handle_send_timeout(send_future, goal_x, goal_y, started))
         goal_handle = send_future.result()
         if goal_handle is None or not goal_handle.accepted:
-            return {'status': 'rejected', 'duration_sec': round(time.time() - started, 3)}
+            # Not accepted -> server is executing nothing -> safe to continue.
+            return self._finish({'status': 'rejected', 'safe_to_continue': True,
+                                 'duration_sec': round(time.time() - started, 3)})
 
         result_future = goal_handle.get_result_async()
         nav_timeout = float(self.get_parameter('nav_goal_timeout_sec').value)
@@ -358,17 +384,28 @@ class InspectionRunner(Node):
                 'Cancelling nav goal (%.3f, %.3f): %s' % (goal_x, goal_y, reason))
             cancel_future = goal_handle.cancel_goal_async()
             rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=5.0)
-            # Wait (bounded) for the goal to actually reach a terminal state
-            # before returning, so dispatching the next goal can't preempt-race
-            # a goal the server is still winding down.
-            settle_deadline = time.time() + 5.0
-            while rclpy.ok() and not result_future.done() and time.time() < settle_deadline:
-                rclpy.spin_once(self, timeout_sec=0.1)
-            return {
+            # Did the server actually accept the cancel (vs the goal finishing
+            # on its own)? goals_canceling is non-empty only when accepted.
+            cancel_accepted = bool(
+                cancel_future.done() and cancel_future.result() is not None
+                and len(cancel_future.result().goals_canceling) > 0)
+            # Wait (bounded) for the goal to actually reach a terminal state.
+            # Only once it is terminal is it safe to dispatch the next goal.
+            terminal = self._await_terminal(result_future, 5.0)
+            out = {
                 'status': reason,
-                'cancel_terminal': 'confirmed' if result_future.done() else 'unconfirmed',
+                'cancel_accepted': cancel_accepted,
+                'cancel_terminal': 'confirmed' if terminal else 'unconfirmed',
+                'safe_to_continue': terminal,
                 'duration_sec': round(time.time() - started, 3),
             }
+            if terminal:
+                # If the goal actually completed on its own, surface the true
+                # outcome instead of pretending the cancel reason was the cause.
+                res = result_future.result()
+                if res is not None:
+                    out['final_nav_status'] = STATUS_TEXT.get(res.status, str(res.status))
+            return out
 
         last_blocked_check = 0.0
         while rclpy.ok() and not result_future.done():
@@ -378,7 +415,7 @@ class InspectionRunner(Node):
             # worst legitimate cross-map navigation so clear goals are never
             # falsely cancelled; a real deadlock never completes either way.
             if nav_timeout > 0.0 and elapsed > nav_timeout:
-                return _cancel('timeout')
+                return self._finish(_cancel('timeout'))
             # Mid-nav re-check (every ~2 s): once the robot is close enough to
             # mark an obstacle sitting ON the target, the goal cell turns
             # lethal -> cancel immediately instead of cycling recovery for the
@@ -387,12 +424,51 @@ class InspectionRunner(Node):
             if elapsed - last_blocked_check >= 2.0:
                 last_blocked_check = elapsed
                 if not self.candidate_is_clear(goal_x, goal_y):
-                    return _cancel('goal_blocked')
+                    return self._finish(_cancel('goal_blocked'))
             rclpy.spin_once(self, timeout_sec=0.1)
         result = result_future.result()
         status_text = STATUS_TEXT.get(result.status, str(result.status))
-        return {
+        return self._finish({
             'status': status_text,
+            'safe_to_continue': True,
+            'duration_sec': round(time.time() - started, 3),
+        })
+
+    def _handle_send_timeout(self, send_future, goal_x: float, goal_y: float,
+                             started: float) -> dict:
+        """A send_goal request did not get a response in time. The request may
+        still be pending inside rclpy; if the server later accepts it the goal
+        runs UNMANAGED. Give the response a bounded second chance: if a handle
+        arrives accepted, cancel it and confirm terminal; only if we can prove
+        nothing is (or will be) executing is it safe to continue."""
+        extra = float(self.get_parameter('server_timeout_sec').value)
+        deadline = time.time() + extra
+        while rclpy.ok() and not send_future.done() and time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if not send_future.done():
+            # Still no response -- the request may yet be accepted server-side.
+            # Stop the client from acting on a late response and fail safe.
+            try:
+                send_future.cancel()
+            except Exception:
+                pass
+            return {'status': 'send_timeout', 'safe_to_continue': False,
+                    'duration_sec': round(time.time() - started, 3)}
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            return {'status': 'send_timeout_rejected', 'safe_to_continue': True,
+                    'duration_sec': round(time.time() - started, 3)}
+        self.get_logger().warn(
+            'Late goal accept after send_timeout (%.3f, %.3f) -- cancelling'
+            % (goal_x, goal_y))
+        result_future = goal_handle.get_result_async()
+        cancel_future = goal_handle.cancel_goal_async()
+        rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=5.0)
+        terminal = self._await_terminal(result_future, 5.0)
+        return {
+            'status': 'send_timeout_cancelled',
+            'cancel_terminal': 'confirmed' if terminal else 'unconfirmed',
+            'safe_to_continue': terminal,
             'duration_sec': round(time.time() - started, 3),
         }
 
@@ -464,6 +540,12 @@ class InspectionRunner(Node):
             result['scan_summary'] = aggregate_scan_summaries([])
             return result
 
+        if self._nav_aborted:
+            result['status'] = 'nav_aborted'
+            result['reason'] = 'prior_nav_goal_unconfirmed'
+            result['scan_summary'] = aggregate_scan_summaries([])
+            return result
+
         selected = None
         attempt_limit = int(self.get_parameter('max_candidate_attempts_per_area').value)
         attempts_made = 0
@@ -501,6 +583,11 @@ class InspectionRunner(Node):
                 selected = candidate
                 break
 
+            # An unconfirmed-terminal goal makes any further dispatch unsafe:
+            # stop trying candidates rather than racing a possibly-live goal.
+            if self._nav_aborted:
+                break
+
             # Let the costmap absorb whatever the robot sensed en route before
             # the next candidate is re-validated against it.
             rclpy.spin_once(self, timeout_sec=0.2)
@@ -511,6 +598,11 @@ class InspectionRunner(Node):
 
         result['blocked_candidates'] = blocked_candidates
         if selected is None:
+            if self._nav_aborted:
+                result['status'] = 'nav_aborted'
+                result['reason'] = 'nav_goal_unconfirmed_terminal'
+                result['scan_summary'] = aggregate_scan_summaries([])
+                return result
             result['status'] = 'nav_failed'
             if blocked_candidates and not result['nav_attempts']:
                 result['reason'] = 'all_candidates_blocked_by_unmapped_obstacle'
@@ -533,6 +625,13 @@ class InspectionRunner(Node):
                 index,
             )
             result['scan_samples'].append(sample)
+            # A turn-in-place goal that we could not confirm terminal aborts the
+            # rest of the sweep (and the mission) for the same safety reason.
+            if self._nav_aborted:
+                result['scan_summary'] = aggregate_scan_summaries(result['scan_samples'])
+                result['status'] = 'nav_aborted'
+                result['reason'] = 'nav_goal_unconfirmed_terminal_during_scan'
+                return result
 
         result['scan_summary'] = aggregate_scan_summaries(result['scan_samples'])
         result['status'] = 'checked'
@@ -627,6 +726,12 @@ class InspectionRunner(Node):
             result['dock_pose'] = pose['dock_pose']
         if dry_run:
             result['result'] = {'status': 'dry_run'}
+            return result
+
+        if self._nav_aborted:
+            # A prior goal could not be confirmed terminal -- do not command the
+            # robot home on top of a possibly-live goal.
+            result['result'] = {'status': 'skipped_nav_aborted', 'safe_to_continue': False}
             return result
 
         self.get_logger().info(
@@ -735,10 +840,12 @@ class InspectionRunner(Node):
         checked = [area for area in report['areas'] if area.get('status') == 'checked']
         failed = [area for area in report['areas'] if area.get('status') == 'nav_failed']
         unchecked = [area for area in report['areas'] if area.get('status') == 'unchecked']
+        aborted = [area for area in report['areas'] if area.get('status') == 'nav_aborted']
         report['summary'].update({
             'checked_count': len(checked),
             'failed_count': len(failed),
             'unchecked_count': len(unchecked),
+            'aborted_count': len(aborted),
         })
 
         report['return_home'] = self.return_home_result(world_model, dry_run)
@@ -746,6 +853,10 @@ class InspectionRunner(Node):
 
         if dry_run:
             report['status'] = 'dry_run'
+        elif self._nav_aborted:
+            # A nav goal could not be confirmed terminal; the mission was stopped
+            # rather than risk commanding the robot on top of a live goal.
+            report['status'] = 'aborted_unsafe_nav_state'
         elif return_status not in {'succeeded', 'disabled'}:
             report['status'] = 'completed_return_failed'
         elif failed or unchecked:
