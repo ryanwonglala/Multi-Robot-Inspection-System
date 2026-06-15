@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import math
 import os
 from pathlib import Path
@@ -17,6 +18,8 @@ from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+from std_msgs.msg import String
 import yaml
 
 from task_layer.model_spawner import (
@@ -107,6 +110,24 @@ class TaskGuiNode(Node):
         self.active_robot = robots[0]
         self.robot_registry = load_robot_registry()
         self.goal_handle = None
+        # Fleet-wide anomaly bus: inspection_runner publishes every photo-diff
+        # detection as a latched JSON event on /anomaly_events (transient_local
+        # so events fired before the GUI opened are replayed on subscribe). We
+        # only collect them here; the red Tk label is refreshed from the main
+        # thread in poll_inspection.
+        self.anomaly_events: list[dict] = []
+        anomaly_qos = QoSProfile(
+            depth=10, reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(
+            String, '/anomaly_events', self._on_anomaly_event, anomaly_qos)
+
+    def _on_anomaly_event(self, msg: String):
+        try:
+            self.anomaly_events.append(json.loads(msg.data))
+        except ValueError:
+            self.get_logger().warn(
+                'Unparseable anomaly event: %s' % msg.data[:120])
 
     @property
     def client(self):
@@ -196,6 +217,10 @@ class TaskGui:
         self.return_home_var = tk.BooleanVar(value=True)
         self.inspect_status_var = tk.StringVar(value='Ready')
         self.latest_report_var = tk.StringVar(value='')
+        # Red anomaly banner (count + last few detections); driven by the
+        # node's /anomaly_events subscription, refreshed in poll_inspection.
+        self.anomaly_var = tk.StringVar(value='')
+        self._anomaly_seen = 0
         self.model_var = tk.StringVar(value=self.node.models[0]['key'] if self.node.models else '')
         self.name_var = tk.StringVar(value='')
         self.area_var = tk.StringVar()
@@ -338,6 +363,9 @@ class TaskGui:
         report.pack(fill='both', expand=True, pady=(10, 0))
         ttk.Label(report, textvariable=self.inspect_status_var).pack(anchor='w', padx=6, pady=(6, 0))
         ttk.Label(report, textvariable=self.latest_report_var, wraplength=420).pack(anchor='w', padx=6, pady=(4, 6))
+        # Anomalies in red: plain tk.Label because ttk.Label has no fg option.
+        tk.Label(report, textvariable=self.anomaly_var, fg='#cc0000',
+                 justify='left', wraplength=420).pack(anchor='w', padx=6, pady=(0, 6))
 
     def _build_scene_tab(self):
         top = ttk.Frame(self.scene_tab)
@@ -575,6 +603,17 @@ class TaskGui:
         self.latest_report_var.set('')
 
     def poll_inspection(self):
+        events = self.node.anomaly_events
+        if len(events) != self._anomaly_seen:
+            self._anomaly_seen = len(events)
+            lines = [
+                '⚠ %s @ %s (%.2f, %.2f)' % (
+                    e.get('robot', '?'), e.get('area', '?'),
+                    float(e.get('x', 0.0)), float(e.get('y', 0.0)))
+                for e in events[-3:]
+            ]
+            self.anomaly_var.set(
+                'Anomalies: %d\n%s' % (len(events), '\n'.join(lines)))
         for ns, process in list(self.inspect_processes.items()):
             if process is None:
                 continue
