@@ -13,6 +13,7 @@ ros_ws/doc/PROJECT_SNAPSHOT.md
 ros_ws/doc/FABLE5_MASTER_PROMPT.md
 ros_ws/doc/DEVLOG.md
 reports/
+baselines/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
