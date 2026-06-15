@@ -195,6 +195,17 @@ areas:
       x_max: 9.370819664
       y_min: -1.15
       y_max: 2.85
+    # East Hall 是大厅，单个中心点覆盖不全：用两个显式观测点（西/东半厅）。
+    # 坐标取自既有基线 sidecar（baselines/east_hall/viewpoint_{1,2}），与现成
+    # 参考照一一对应，从而复用旧版已验证的差分基线 —— 剔除 codex 误打的
+    # center 标签（导致基线查不到、east_hall 静默零检出）。
+    viewpoints:
+    - x: 4.009
+      y: 1.096
+      yaw: 0.0
+    - x: 7.502
+      y: 0.842
+      yaw: 0.0905
     color_rgba:
     - 0.78
     - 0.92

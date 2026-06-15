@@ -57,15 +57,16 @@ class TaskAllocator(Node):
         except rclpy.exceptions.ParameterAlreadyDeclaredException:
             pass
         # Photo-diff baseline, forwarded verbatim to every runner.
-        # baseline_capture:=true turns this dispatch into a clean-scene baseline
+        # baseline_record:=true turns this dispatch into a clean-scene baseline
         # patrol (record reference photos, no diff); otherwise each runner diffs
         # its views against baseline_dir. The default dir matches the runner's
-        # own default, so GUI/Auto-allocate detection finds the baselines with
-        # no extra flags once a baseline has been recorded.
-        self.declare_parameter('baseline_capture', False)
+        # own default (OLD flat layout: baselines/<area>/<stop>/yawNN.ppm),
+        # so GUI/Auto-allocate detection finds the baselines with no extra
+        # flags once a baseline has been recorded.
+        self.declare_parameter('baseline_record', False)
         self.declare_parameter(
             'baseline_dir',
-            str(Path.home() / 'roboinspec_ws' / 'baselines' / 'photo_diff'))
+            str(Path.home() / 'roboinspec_ws' / 'baselines'))
 
         with open(self.get_parameter('robots_yaml').value, encoding='utf-8') as f:
             registry = yaml.safe_load(f)
@@ -234,8 +235,8 @@ class TaskAllocator(Node):
                 '-p', f"route:={','.join(areas)}",
                 '-p', 'return_home:=false',
                 '-p', f'report_dir:={report_dir}',
-                '-p', 'baseline_capture:=' + str(
-                    bool(self.get_parameter('baseline_capture').value)).lower(),
+                '-p', 'baseline_record:=' + str(
+                    bool(self.get_parameter('baseline_record').value)).lower(),
                 '-p', f"baseline_dir:={self.get_parameter('baseline_dir').value}",
             ]
             log_file = open(report_dir / 'allocator_run.log', 'w', encoding='utf-8')
