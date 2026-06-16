@@ -6,17 +6,21 @@ from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
-# Per-robot sim models match the real camera hardware:
-#   tb3 (Robot B) -> ASUS Webcam C3       : mono RGB        (burger_cam_ns)
-#   arm (Robot A) -> RealSense D436 depth : RGB-D + points  (burger_d436_ns)
-# The arm sim stand-in is still a burger chassis; the Final swaps in the real
-# mobile manipulator under the same 'arm' namespace, keeping the D436 model.
+# Photo-diff line: BOTH robots are ASUS-C3 640x480 RGB scouts (burger_cam_ns),
+# so they share the ONE validated 640x480 photo-diff baseline -- this matches the
+# OLD p1-5v "native" dual-scout config (which had no D436 model at all). A robot
+# on a different camera (e.g. the D436's 848x480) would hit baseline_shape_mismatch
+# and silently detect nothing on its half of the map.
+# (burger_d436_ns -- a RealSense D436 depth stand-in -- belongs to the PARKED
+# A-axis depth-verification work and is NOT used here; nothing in task_layer
+# consumes depth/points. The Final's real mobile manipulator can re-introduce its
+# own sensor + per-robot baseline under the 'arm' namespace when that revives.)
 ROBOTS = [
     # Docked face-to-wall on opposite sides of the mother_base corridor:
     # tb3 at the south-wall charging station, arm mirrored on the north wall.
     {'ns': 'tb3', 'model': 'turtlebot3_burger_cam_ns',
      'x': '-4.8', 'y': '-3.825', 'yaw': '-1.5708'},
-    {'ns': 'arm', 'model': 'turtlebot3_burger_d436_ns',
+    {'ns': 'arm', 'model': 'turtlebot3_burger_cam_ns',
      'x': '-4.8', 'y': '-2.95',  'yaw': '1.5708'},
 ]
 

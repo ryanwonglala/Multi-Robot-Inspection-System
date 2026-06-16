@@ -391,6 +391,7 @@ class InspectionRunner(Node):
             stop_groups.setdefault(label, []).append((yaw_index, sample))
 
         all_found: list[dict] = []
+        checked_total = 0
         for label, stop_samples in stop_groups.items():
             stop_dict = {'label': label,
                          'x': (stop_samples[0][1].get('pose_at_capture') or (0, 0, 0))[0],
@@ -399,6 +400,7 @@ class InspectionRunner(Node):
                 area_key_for_stop, area, stop_dict, stop_samples)
             outcome['views'].extend(stop_result.get('views', []))
             all_found.extend(stop_result.get('anomalies', []))
+            checked_total += int(stop_result.get('photos_checked', 0))
 
         # Cross-stop merge
         all_found = merge_photo_detections(
@@ -408,12 +410,15 @@ class InspectionRunner(Node):
 
         if record:
             outcome['status'] = 'baseline_recorded'
-        elif all_found or any(s.get('status') == 'checked'
-                              for s in outcome.get('views', [])):
+        elif checked_total > 0 or all_found:
+            # A clean area still ran the diff (checked_total>0 photos compared,
+            # zero anomalies) -- that IS 'checked', not 'no_baseline'. Only fall
+            # to 'no_baseline' when not a single view could be compared.
             outcome['status'] = 'checked'
         else:
             outcome['status'] = 'no_baseline'
 
+        outcome['photos_checked'] = checked_total
         outcome['anomalies'] = all_found
         return outcome
 
@@ -506,6 +511,9 @@ class InspectionRunner(Node):
                 anomaly['detected_from'] = {
                     'stop': stop_label, 'yaw_index': yaw_index,
                     'photo': photo}
+                # Surface the evidence photo on the standard field too, so the
+                # event JSON / GUI / report all carry it (not just detected_from).
+                anomaly['evidence_photo'] = photo
                 found.append(anomaly)
         outcome['status'] = 'checked' if checked else 'no_baseline'
         outcome['anomalies'] = merge_photo_detections([], found)
