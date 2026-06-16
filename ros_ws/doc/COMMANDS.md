@@ -81,6 +81,34 @@ ls ~/roboinspec_ws/reports/tb3/ ~/roboinspec_ws/reports/arm/
 grep -E "status|checked_count|failed_count" ~/roboinspec_ws/reports/*/inspection_*/report.yaml
 ```
 
+## 6b. 录制视觉基线（换设备 / 换地图 / 改观测点后必做）
+
+> **基线 = 干净场景参考照**，照片差分拿当前帧跟它比。下面三条任一不满足，就在
+> **目标机器、干净场景**下重录一次（这就是换设备后"开箱不能直接用"的原因）：
+> 1. **不进 git**（`baselines/` 已 gitignore）→ `git pull` **不会**带过来；
+> 2. **与渲染强相关** → 换机器(GPU/驱动)、换地图/world、改相机 SDF 后，旧基线会误报/漏检；
+> 3. **跟随 viewpoints** → 改了某区 `viewpoints` 后新观测点没基线 → 该区报 `checked_no_baseline`、不检出。
+
+```bash
+# 前提：① 场景干净(不放任何箱子) ② 已 colcon build ③ 起栈并等 AMCL 稳(~40s)
+ros2 launch task_layer multi_nav.launch.py        # 终端1
+
+# 录制：baseline_record:=true 把这一轮巡逻变成"录基线"，双机分工，
+# 写入默认 ~/roboinspec_ws/baselines/<区>/<停靠点>/yawNN.ppm (+ 同名 .json 位姿)
+ros2 run task_layer task_allocator.py --ros-args \
+  -p baseline_record:=true -p return_home:=false \
+  -p route:='entrance_lobby,main_corridor,central_hall,north_hall,east_hall,server_room,restricted_gate,storage_area,utility_area,narrow_passage'
+
+# 验证：每个 stop 应有 yaw00..05.ppm(+ 同名 json)；restricted_gate 只 3 张(3 个 scan_yaw)
+ls -R ~/roboinspec_ws/baselines | grep -E 'main_corridor|narrow_passage|east_hall|restricted_gate' -A2
+```
+
+**停靠点由 world_model 决定（机器人到哪个停就录哪个）**：
+- viewpoint 区：`main_corridor` / `narrow_passage` / `east_hall` → `viewpoint_1` + `viewpoint_2`；`restricted_gate` → `viewpoint_1`。
+- 环形区（central_hall 等 6 个）→ `center`。一次干净跑只到第一个可达点(center)；`east_wide` 是备份点，仅当异常正压在该区中心采样点时才用到，缺了只让该区报 `checked_no_baseline`（不会静默漏）。
+
+**要点**：① 干净场景是硬前提（基线脏了全盘皆误）；② 双机共用同一套基线（两机相机同为 ASUS-C3 640×480，谁录哪区都一样）；③ 单区补录可用 §7 的 runner 加 `-p baseline_record:=true`；④ 录完布箱、GUI Auto-allocate 跑一轮确认检出。
+
 ## 7. 单独跑巡检 runner（无 GUI，调试用）
 
 ```bash
