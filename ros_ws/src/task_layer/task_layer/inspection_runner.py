@@ -341,9 +341,21 @@ class InspectionRunner(Node):
                 / f'yaw{yaw_index:02d}.ppm')
 
     def detect_bounds(self, area: dict):
-        """Inspected area's bounds shrunk by the detection margin (doorway
-        leakage filter, same rule the P1-4 gates passed with)."""
-        bounds = area.get('bounds') or {}
+        """Bounds (shrunk by the detection margin) a detection must fall inside
+        to count -- the doorway-leakage filter. Normally the inspected area's
+        own bounds; but a doorway viewpoint that photographs INTO another area
+        sets photo_detect_bounds_area to clip against THAT area's bounds. Its
+        own 0.45 m strip is degenerate (margin inverts it -> everything clipped),
+        while simply disabling the clip lets the near door-frame parallax project
+        a phantom anomaly at the threshold (observed: clean FP at (7.564,3.222)).
+        Clipping to the watched room keeps real in-room hits and drops the
+        doorway phantom, which projects short of the room's near edge."""
+        ref = area.get('photo_detect_bounds_area')
+        if ref:
+            world_model = getattr(self, '_world_model', None) or {}
+            bounds = ((world_model.get('areas') or {}).get(ref) or {}).get('bounds') or {}
+        else:
+            bounds = area.get('bounds') or {}
         if not all(k in bounds for k in ('x_min', 'x_max', 'y_min', 'y_max')):
             return None
         margin = float(self.get_parameter('detect_bounds_margin').value)
@@ -1137,7 +1149,23 @@ class InspectionRunner(Node):
                                          {'x': stop['x'], 'y': stop['y']})
 
         result['scan_summary'] = aggregate_scan_summaries(result['scan_samples'])
-        result['status'] = 'checked'
+        # Observability: a stop we navigated to and photographed but for which NO
+        # baseline could be compared (photo_diff -> 'no_baseline') is NOT a clean
+        # inspection. Surface it as a distinct status (+ warn) so a baseline gap
+        # cannot masquerade as 'checked' in the mission summary -- e.g. a ring
+        # fall-through to an un-recorded backup stop (observed: main_corridor box
+        # at center blocked center+east_wide, robot scanned the un-recorded
+        # north_wide -> silent no_baseline), or a new viewpoint not yet recorded.
+        # Only triggers in detect mode (photo_diff actually ran).
+        if photo_diff_on and result['photo_diff'].get('status') == 'no_baseline':
+            result['status'] = 'checked_no_baseline'
+            self.get_logger().warn(
+                '%s: scanned %d photo(s) but found no baseline to diff against '
+                '(photo_diff=no_baseline) -- area NOT inspected for anomalies; '
+                'record its baseline at the visited stop(s)'
+                % (area_key, len(result['scan_samples'])))
+        else:
+            result['status'] = 'checked'
         return result
 
     def create_run_dir(self, route: list[str]) -> Path:
@@ -1311,6 +1339,9 @@ class InspectionRunner(Node):
 
     def run_once(self) -> int:
         world_model = self.load_world_model()
+        # Kept on the node so detect_bounds() can resolve a viewpoint's
+        # photo_detect_bounds_area (e.g. restricted_gate -> restricted_zone).
+        self._world_model = world_model
         targets = self.requested_targets()
         resolved = [self.resolve_area(world_model, target) for target in targets]
         dry_run = bool(self.get_parameter('dry_run').value)
@@ -1335,6 +1366,7 @@ class InspectionRunner(Node):
                 'checked_count': 0,
                 'failed_count': 0,
                 'unchecked_count': 0,
+                'no_baseline_count': 0,
             },
             'areas': [],
             'return_home': None,
@@ -1349,6 +1381,8 @@ class InspectionRunner(Node):
         failed = [area for area in report['areas'] if area.get('status') == 'nav_failed']
         unchecked = [area for area in report['areas'] if area.get('status') == 'unchecked']
         aborted = [area for area in report['areas'] if area.get('status') == 'nav_aborted']
+        no_baseline = [area for area in report['areas']
+                       if area.get('status') == 'checked_no_baseline']
         anomalies = []
         for area in report['areas']:
             for anomaly in (area.get('photo_diff') or {}).get('anomalies', []):
@@ -1359,6 +1393,7 @@ class InspectionRunner(Node):
             'failed_count': len(failed),
             'unchecked_count': len(unchecked),
             'aborted_count': len(aborted),
+            'no_baseline_count': len(no_baseline),
             'anomaly_count': len(anomalies),
         })
 
@@ -1373,7 +1408,9 @@ class InspectionRunner(Node):
             report['status'] = 'aborted_unsafe_nav_state'
         elif return_status not in {'succeeded', 'disabled'}:
             report['status'] = 'completed_return_failed'
-        elif failed or unchecked:
+        elif failed or unchecked or no_baseline:
+            # A scanned-but-undiffable area (no baseline) is a partial inspection
+            # failure, same class as unchecked -- it must not read as 'completed'.
             report['status'] = 'completed_with_failures'
         else:
             report['status'] = 'completed'

@@ -51,6 +51,17 @@ areas:
       x_max: 0.95
       y_min: -4.55
       y_max: -0.65
+    # 走廊细长(1.9×3.9)：单个环形候选点中心放箱会堵死 center+east_wide
+    # 两个录过基线的停靠点，机器人降级到没基线的备选点 → no_baseline 静默零检出
+    # (实证 mission_20260616T001441Z)。改用两个显式观测点：偏离中心 ~1m
+    # 各覆盖走廊一半，中心放箱堵不到任一点。基线需按这两点重录。
+    viewpoints:
+    - x: 0.0
+      y: -1.6
+      yaw: 0.0
+    - x: 0.0
+      y: -3.6
+      yaw: 0.0
     color_rgba:
     - 0.479999989
     - 0.819999993
@@ -277,6 +288,12 @@ areas:
     - 2.3562
     - 1.5708
     - 0.7854
+    # 门口朝里拍禁区：本区自身 bounds 是 0.45m 深门条带，detect_bounds 各向内缩后
+    # y 带反转=空矩形，clip 默认 True 把禁区检出全丢(实证 anomalies=[])。但直接
+    # 关 clip(=false)又会让近处门框视差在干净场景投出门口幻影 FP(实证 clean 报
+    # (7.564,3.222))。正解：clip 仍开，但把判定边界指向它真正监视的 restricted_zone
+    # ——禁区内真异常保留，门口幻影(y<zone_y_min+margin=3.45)被剔除。
+    photo_detect_bounds_area: restricted_zone
     color_rgba:
     - 0.949999988
     - 0.340000004
@@ -360,6 +377,17 @@ areas:
       x_max: 9.05
       y_min: -5.7
       y_max: -4.7
+    # 与 main_corridor 同病(更窄更长 1.0×6.28，只录了 center/east_wide)：
+    # 中心放箱堵死录过基线的点 → 降级到没基线的备选点 → no_baseline 静默零检出，
+    # 且单点覆盖不了 6.28m 长通道。两个显式观测点沿长轴(x)，偏离中心，各 360°
+    # 环拍覆盖通道两半。基线需按这两点重录。
+    viewpoints:
+    - x: 4.5
+      y: -5.2
+      yaw: 0.0
+    - x: 7.3
+      y: -5.2
+      yaw: 0.0
     color_rgba:
     - 0.980000019
     - 0.579999983
