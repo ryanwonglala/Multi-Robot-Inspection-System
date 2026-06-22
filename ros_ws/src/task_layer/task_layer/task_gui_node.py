@@ -48,7 +48,14 @@ STATUS_TEXT = {
 INSPECT_DISABLED_AREAS = {'mother_base', 'charging_station', 'server_door'}
 
 # Task 1.2: The only models that can be selected in the Scene tab.
-ALLOWED_SCENE_MODELS = {'small_box', 'medium_box', 'large_box'}
+# Spawnable shapes for robustness validation. Boxes keep all three sizes
+# (0.25 / 0.45 / 0.70 m). Cylinder/cone/sphere are large-only (0.20 m) — the
+# 2.5 / 8 cm medium/small variants were too small to be a useful visual
+# reference and were removed. Cone is an STL mesh under models/primitives/.
+ALLOWED_SCENE_MODELS = {
+    'small_box', 'medium_box', 'large_box',
+    'large_cylinder', 'large_cone', 'large_sphere',
+}
 
 
 def default_world_model_path() -> str:

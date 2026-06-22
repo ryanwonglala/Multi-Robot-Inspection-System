@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<sdf version="1.9">
+  <model name="large_cylinder">
+    <static>true</static>
+    <link name="body">
+      <pose>0 0 0.1000 0 0 0</pose>
+      <collision name="collision">
+        <geometry>
+          <cylinder><radius>0.1000</radius><length>0.2000</length></cylinder>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <cylinder><radius>0.1000</radius><length>0.2000</length></cylinder>
+        </geometry>
+        <material>
+          <diffuse>0.080 0.250 0.700 1</diffuse>
+          <ambient>0.056 0.175 0.490 1</ambient>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
