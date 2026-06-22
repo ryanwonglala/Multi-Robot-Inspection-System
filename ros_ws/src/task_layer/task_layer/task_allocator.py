@@ -29,7 +29,6 @@ from rclpy.qos import (
 import yaml
 
 from task_layer.report_writer import (
-    capture_rviz_screenshot,
     default_report_dir,
     prune_report_dirs,
 )
@@ -383,10 +382,6 @@ class TaskAllocator(Node):
         with details_path.open('w', encoding='utf-8') as f:
             yaml.safe_dump(mission, f, sort_keys=False, allow_unicode=True)
 
-        # Capture the final RViz screenshot BEFORE rendering the Markdown so it
-        # can link to rviz_final.png.
-        capture_rviz_screenshot(mission_dir)
-
         # File 2: bilingual Markdown mission summary.
         md_path = self._write_mission_markdown(mission, mission_dir, robots)
 
@@ -469,9 +464,6 @@ class TaskAllocator(Node):
 
         lines.append('## 相关文件 / Related Files\n')
         lines.append(f'- **完整机读报告 / Full machine report**: `{mission_dir / "mission_details.yaml"}`')
-        screenshot = mission_dir / 'rviz_final.png'
-        if screenshot.exists():
-            lines.append(f'- **RViz 截图 / RViz screenshot**: `{screenshot}`')
         lines.append('')
 
         md_path = mission_dir / 'mission_report.md'

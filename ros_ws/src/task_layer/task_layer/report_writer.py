@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import re
 import shutil
-import struct
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
 
 import yaml
 
@@ -121,10 +117,6 @@ def write_markdown_report(
     lines.append('## 相关文件 / Related Files\n')
     if details_file:
         lines.append(f'- **完整机读报告 / Full machine report**: `{details_file}`')
-    # Link to screenshot if it exists
-    screenshot = target_dir / 'rviz_final.png'
-    if screenshot.exists():
-        lines.append(f'- **RViz 截图 / RViz screenshot**: `{screenshot}`')
     lines.append('')
 
     path.write_text('\n'.join(lines), encoding='utf-8')
@@ -163,92 +155,3 @@ def prune_report_dirs(
         except Exception:
             pass
     return removed
-
-
-def _find_rviz_window_id() -> Optional[str]:
-    """Return the X window id of the largest mapped window that looks like
-    RViz (via xwininfo), or None. No wmctrl/xdotool needed."""
-    try:
-        tree = subprocess.run(
-            ['xwininfo', '-root', '-tree'],
-            capture_output=True, text=True, timeout=5).stdout
-    except Exception:
-        return None
-    best_area = -1
-    best_id = None
-    for line in tree.splitlines():
-        if 'rviz' not in line.lower():
-            continue
-        # e.g.  0x4800106 "cfg* - RViz": ("rviz2" "rviz2")  1545x1124+20+90  +162+476
-        m = re.search(r'(0x[0-9a-fA-F]+).*?\s(\d+)x(\d+)\+-?\d+\+-?\d+', line)
-        if not m:
-            continue
-        area = int(m.group(2)) * int(m.group(3))
-        if area > best_area:
-            best_area, best_id = area, m.group(1)
-    return best_id
-
-
-def _xwd_bytes_to_image(data: bytes):
-    """Decode an XWD (X Window Dump) byte stream into a PIL RGB Image.
-
-    Handles the common TrueColor 24/32-bpp ZPixmap dumps that `xwd -id`
-    produces; channel order is derived from the header masks + byte order."""
-    from PIL import Image  # optional dependency, imported lazily
-    if len(data) < 100:
-        raise ValueError('xwd stream too short')
-    hdr = struct.unpack('>25I', data[:100])
-    header_size = hdr[0]
-    width, height = hdr[4], hdr[5]
-    byte_order = hdr[7]            # 0 = LSBFirst, 1 = MSBFirst
-    bpp = hdr[11]
-    bytes_per_line = hdr[12] or (width * (bpp // 8))
-    rmask, gmask, bmask = hdr[14], hdr[15], hdr[16]
-    ncolors = hdr[19]
-    # Pixel data follows the header (incl. window-name string) and the colormap
-    # (ncolors * 12-byte XWDColor entries, present even for TrueColor visuals).
-    pix = data[header_size + ncolors * 12:]
-    nbytes = max(1, bpp // 8)
-    pos = {}
-    for ch, mask in zip('RGB', (rmask, gmask, bmask)):
-        if not mask:
-            continue
-        value_byte = (mask.bit_length() - 1) // 8
-        mem = value_byte if byte_order == 0 else (nbytes - 1 - value_byte)
-        pos[mem] = ch
-    rawmode = ''.join(pos.get(i, 'X') for i in range(nbytes))
-    return Image.frombytes('RGB', (width, height), pix, 'raw',
-                           rawmode, bytes_per_line, 1)
-
-
-def capture_rviz_screenshot(
-    target_dir: str | Path,
-    filename: str = 'rviz_final.png',
-) -> Optional[Path]:
-    """Best-effort screenshot of the RViz window ONLY (not the full screen).
-
-    Locates the RViz window via xwininfo and dumps its own pixels with
-    `xwd -id` (works even when RViz is occluded by another window), then
-    decodes the XWD stream to PNG. Returns the saved Path, or None if RViz is
-    not found / X tooling is missing / any step fails. NEVER raises, and never
-    falls back to a full-screen capture.
-
-    Task 5.1 — RViz-window capture (replaces the earlier full-screen grab).
-    """
-    try:
-        win_id = _find_rviz_window_id()
-        if not win_id:
-            return None
-        dump = subprocess.run(
-            ['xwd', '-silent', '-id', win_id],
-            capture_output=True, timeout=10)
-        if dump.returncode != 0 or not dump.stdout:
-            return None
-        img = _xwd_bytes_to_image(dump.stdout)
-        target_dir = Path(target_dir).expanduser()
-        target_dir.mkdir(parents=True, exist_ok=True)
-        path = target_dir / filename
-        img.save(str(path))
-        return path
-    except Exception:
-        return None

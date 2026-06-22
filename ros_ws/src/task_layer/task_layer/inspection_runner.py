@@ -29,7 +29,6 @@ from task_layer.photo_diff_check import (
     merge_photo_detections,
 )
 from task_layer.report_writer import (
-    capture_rviz_screenshot,
     default_report_dir,
     prune_report_dirs,
     write_markdown_report,
@@ -1428,15 +1427,11 @@ class InspectionRunner(Node):
         report['summary_report'] = summary_report
         # 3. Write the full report (now includes summary_report) as details.yaml.
         write_report(report, run_dir, filename='details.yaml')
-        # 4. Capture the final RViz screenshot BEFORE rendering report.md so the
-        #    Markdown can link to rviz_final.png (skip during dry_run).
-        if not dry_run:
-            capture_rviz_screenshot(run_dir)
-        # 5. Write the bilingual Markdown summary.
+        # 4. Write the bilingual Markdown summary.
         md_path = write_markdown_report(summary_report, run_dir, 'report.md')
-        # 6. Log exactly the required prefix so the GUI can grep it; point to report.md.
+        # 5. Log exactly the required prefix so the GUI can grep it; point to report.md.
         self.get_logger().info('Inspection report written: %s' % md_path)
-        # 7. report.yaml is no longer written. Retention: keep 10 newest runs.
+        # 6. report.yaml is no longer written. Retention: keep 10 newest runs.
         if not dry_run:
             prune_report_dirs(run_dir.parent, 'inspection_*', keep=10)
         return 0 if report['status'] in {'completed', 'dry_run'} else 5
