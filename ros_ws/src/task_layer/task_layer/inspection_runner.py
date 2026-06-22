@@ -28,7 +28,13 @@ from task_layer.photo_diff_check import (
     detect_changes,
     merge_photo_detections,
 )
-from task_layer.report_writer import default_report_dir, write_report
+from task_layer.report_writer import (
+    capture_rviz_screenshot,
+    default_report_dir,
+    prune_report_dirs,
+    write_markdown_report,
+    write_report,
+)
 from task_layer.scan_analyzer import aggregate_scan_summaries, summarize_scan
 
 
@@ -1415,11 +1421,24 @@ class InspectionRunner(Node):
         else:
             report['status'] = 'completed'
 
-        details_path = write_report(report, run_dir, filename='details.yaml')
-        summary_report = self.build_summary_report(report, details_path)
-        report_path = write_report(summary_report, run_dir, filename='report.yaml')
-        self.get_logger().info('Inspection report written: %s' % report_path)
-        self.get_logger().info('Inspection details written: %s' % details_path)
+        # Task 5.2 — two-file report layout: details.yaml (full machine) + report.md (bilingual).
+        # 1. Build the summary from the report dict (details_path is set to details.yaml).
+        summary_report = self.build_summary_report(report, run_dir / 'details.yaml')
+        # 2. Embed the summary so the allocator can read it from details.yaml without report.yaml.
+        report['summary_report'] = summary_report
+        # 3. Write the full report (now includes summary_report) as details.yaml.
+        write_report(report, run_dir, filename='details.yaml')
+        # 4. Capture the final RViz screenshot BEFORE rendering report.md so the
+        #    Markdown can link to rviz_final.png (skip during dry_run).
+        if not dry_run:
+            capture_rviz_screenshot(run_dir)
+        # 5. Write the bilingual Markdown summary.
+        md_path = write_markdown_report(summary_report, run_dir, 'report.md')
+        # 6. Log exactly the required prefix so the GUI can grep it; point to report.md.
+        self.get_logger().info('Inspection report written: %s' % md_path)
+        # 7. report.yaml is no longer written. Retention: keep 10 newest runs.
+        if not dry_run:
+            prune_report_dirs(run_dir.parent, 'inspection_*', keep=10)
         return 0 if report['status'] in {'completed', 'dry_run'} else 5
 
     def capture_nav_fail_evidence(self, area_key: str, area_dir: Path, attempt_index: int) -> dict | None:

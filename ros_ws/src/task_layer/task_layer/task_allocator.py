@@ -28,7 +28,11 @@ from rclpy.qos import (
 )
 import yaml
 
-from task_layer.report_writer import default_report_dir
+from task_layer.report_writer import (
+    capture_rviz_screenshot,
+    default_report_dir,
+    prune_report_dirs,
+)
 
 
 def default_share(name: str) -> str:
@@ -370,19 +374,146 @@ class TaskAllocator(Node):
             'robots': robots,
         }
         mission_dir.mkdir(parents=True, exist_ok=True)
-        path = mission_dir / 'report.yaml'
-        with path.open('w', encoding='utf-8') as f:
-            f.write(self.MISSION_REPORT_GUIDE)
+
+        # Task 5.3 — two-file mission report layout: mission_details.yaml (machine) +
+        # mission_report.md (bilingual Markdown). report.yaml is no longer written.
+
+        # File 1: full machine-readable mission dict.
+        details_path = mission_dir / 'mission_details.yaml'
+        with details_path.open('w', encoding='utf-8') as f:
             yaml.safe_dump(mission, f, sort_keys=False, allow_unicode=True)
-        return path
+
+        # Capture the final RViz screenshot BEFORE rendering the Markdown so it
+        # can link to rviz_final.png.
+        capture_rviz_screenshot(mission_dir)
+
+        # File 2: bilingual Markdown mission summary.
+        md_path = self._write_mission_markdown(mission, mission_dir, robots)
+
+        # Retention: keep only the 10 newest missions.
+        prune_report_dirs(mission_dir.parent, 'mission_*', keep=10)
+
+        return md_path
+
+    def _write_mission_markdown(
+        self,
+        mission: dict,
+        mission_dir: Path,
+        robots: dict,
+    ) -> Path:
+        """Render a simplified bilingual Markdown mission report.
+
+        Task 5.3 — mission-level counterpart of write_markdown_report.
+        Reuses the bilingual spirit of MISSION_REPORT_GUIDE.
+        """
+        m = mission.get('mission') or {}
+        status = m.get('status', 'unknown')
+        generated_at = m.get('generated_at', '')
+        duration_sec = m.get('duration_sec', 0)
+        route_requested = m.get('route_requested') or []
+        allocation = m.get('allocation') or {}
+
+        STATUS_MAP = {
+            'completed': '已完成 / Completed',
+            'completed_with_failures': '完成但有失败项 / Completed with failures',
+        }
+        status_label = STATUS_MAP.get(status, status)
+
+        lines: list[str] = []
+        lines.append('# RoboInspect 联合巡检报告 / Mission Report\n')
+
+        lines.append('## 概要 / Summary\n')
+        lines.append(f'- **整体状态 / Overall status**: `{status_label}`')
+        lines.append(f'- **生成时间 / Generated at**: {generated_at}')
+        lines.append(f'- **任务时长 / Duration**: {duration_sec} s')
+        if route_requested:
+            lines.append(f'- **请求路线 / Requested route**: {", ".join(f"`{r}`" for r in route_requested)}')
+        lines.append('')
+
+        lines.append('## 任务分配 / Allocation\n')
+        if allocation:
+            for ns, areas in allocation.items():
+                areas_str = ', '.join(f'`{a}`' for a in areas) if areas else '_(none)_'
+                lines.append(f'- **{ns}**: {areas_str}')
+        else:
+            lines.append('_(no allocation)_')
+        lines.append('')
+
+        lines.append('## 各机器人结果 / Per-robot Results\n')
+        for ns, entry in robots.items():
+            lines.append(f'### {ns}\n')
+            r_status = entry.get('status', 'unknown')
+            lines.append(f'- **状态 / Status**: `{r_status}`')
+            checked = entry.get('checked', '?/?')
+            lines.append(f'- **完成区域 / Checked**: {checked}')
+            rh = entry.get('return_home', 'unknown')
+            lines.append(f'- **回桩 / Return home**: `{rh}`')
+            exit_code = entry.get('exit_code')
+            if exit_code is not None:
+                lines.append(f'- **退出码 / Exit code**: {exit_code}')
+            areas = entry.get('areas') or []
+            if areas:
+                lines.append('')
+                lines.append('| 区域 / Area | 显示名 / Display Name | 状态 / Status | 照片 / Photos |')
+                lines.append('|---|---|---|---|')
+                for a in areas:
+                    ak = a.get('area') or ''
+                    dn = a.get('display_name') or ak
+                    ast = a.get('status') or 'unknown'
+                    photos = a.get('photos', 0)
+                    lines.append(f'| `{ak}` | {dn} | `{ast}` | {photos} |')
+            detail_report = entry.get('detail_report', '')
+            if detail_report:
+                lines.append(f'\n- **详细报告 / Detail report**: `{detail_report}`')
+            lines.append('')
+
+        lines.append('## 相关文件 / Related Files\n')
+        lines.append(f'- **完整机读报告 / Full machine report**: `{mission_dir / "mission_details.yaml"}`')
+        screenshot = mission_dir / 'rviz_final.png'
+        if screenshot.exists():
+            lines.append(f'- **RViz 截图 / RViz screenshot**: `{screenshot}`')
+        lines.append('')
+
+        md_path = mission_dir / 'mission_report.md'
+        md_path.write_text('\n'.join(lines), encoding='utf-8')
+        return md_path
 
     def _latest_runner_report(self, ns_dir: Path) -> tuple[dict, Path] | None:
+        # Task 5.3 — read details.yaml (report.yaml removed); use embedded
+        # summary_report as the structured view so all downstream field reads
+        # (status, summary.checked_count, areas[], return_home, …) keep working.
         runs = sorted(d for d in ns_dir.glob('inspection_*') if d.is_dir())
         for run_dir in reversed(runs):
-            report_file = run_dir / 'report.yaml'
+            report_file = run_dir / 'details.yaml'
             if report_file.exists():
                 with report_file.open(encoding='utf-8') as f:
-                    return yaml.safe_load(f) or {}, report_file
+                    data = yaml.safe_load(f) or {}
+                view = data.get('summary_report')
+                if view is None:
+                    # Runner exited before embedding summary_report (e.g. crash):
+                    # normalize the full-report area shape (target_area -> area,
+                    # scan_samples -> photo count) so the mission report still
+                    # reads sane fields instead of None/0.
+                    view = {
+                        'task': data.get('task'),
+                        'status': data.get('status'),
+                        'route': data.get('route'),
+                        'summary': data.get('summary') or {},
+                        'anomalies': data.get('anomalies', []),
+                        'return_home': data.get('return_home'),
+                        'areas': [
+                            {
+                                'area': a.get('target_area'),
+                                'display_name': a.get('display_name'),
+                                'status': a.get('status'),
+                                'captured_image_count': len(a.get('scan_samples') or []),
+                                'evidence_dir': a.get('evidence_dir'),
+                                **({'reason': a['reason']} if a.get('reason') else {}),
+                            }
+                            for a in (data.get('areas') or [])
+                        ],
+                    }
+                return view, report_file
         return None
 
     def _home_goal(self, ns: str) -> NavigateToPose.Goal:

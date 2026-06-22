@@ -43,6 +43,13 @@ STATUS_TEXT = {
     GoalStatus.STATUS_ABORTED: 'aborted',
 }
 
+# Task 2.1: Areas that are structurally available in the map but must NOT be
+# added to an inspection route (GUI-only restriction; world_model.yaml unchanged).
+INSPECT_DISABLED_AREAS = {'mother_base', 'charging_station', 'server_door'}
+
+# Task 1.2: The only models that can be selected in the Scene tab.
+ALLOWED_SCENE_MODELS = {'small_box', 'medium_box', 'large_box'}
+
 
 def default_world_model_path() -> str:
     share_dir = get_package_share_directory('task_layer')
@@ -201,6 +208,9 @@ class TaskGui:
         self.inspect_processes = {}   # ns -> Popen
         self.inspect_logs = {}        # ns -> (file handle, Path)
         self.spawn_count = 0
+        # Task 4: track whether we have already shown the allocation block in
+        # the Inspection Status text so we only inject it once per run.
+        self._allocation_shown = False
 
         self.root = tk.Tk()
         self.root.title('RoboInspect Task GUI')
@@ -210,7 +220,8 @@ class TaskGui:
         self.status_var = tk.StringVar(value='Ready')
         self.detail_var = tk.StringVar(value='')
         self.target_var = tk.StringVar()
-        self.inspect_route_var = tk.StringVar()
+        # Task 2.3: the editable Target Rooms tk.Text (_route_text) is the canonical
+        # route store; get_route()/set_route() are the only accessors.
         self.inspect_mode_var = tk.StringVar(value='auto')
         self.max_attempts_var = tk.StringVar(value='2')
         self.spread_ratio_var = tk.StringVar(value='0.35')
@@ -227,7 +238,7 @@ class TaskGui:
         self.placement_var = tk.StringVar(value='center')
         self.x_var = tk.StringVar(value='0.000')
         self.y_var = tk.StringVar(value='0.000')
-        self.z_var = tk.StringVar(value='0.250')
+        self.z_var = tk.StringVar(value='0.000')  # Task 1.4: default to floor level
         self.yaw_var = tk.StringVar(value='0.000')
         self.margin_var = tk.StringVar(value='0.200')
         self.allow_renaming_var = tk.BooleanVar(value=False)
@@ -270,9 +281,36 @@ class TaskGui:
         ttk.Label(status, textvariable=self.status_var).pack(anchor='w')
         ttk.Label(status, textvariable=self.detail_var).pack(anchor='w')
 
-    def _build_area_list(self, parent, select_callback=None, double_callback=None):
+    def _area_available(self, key, area, force_available_keys, disabled_keys):
+        """Per-tab availability: force_available wins; otherwise accessible and
+        not in the tab's disabled set."""
+        if key in force_available_keys:
+            return True
+        return area.get('accessible', True) and key not in disabled_keys
+
+    def _build_area_list(self, parent, select_callback=None, double_callback=None,
+                         force_available_keys=None, disabled_keys=None,
+                         selectmode='browse'):
+        """Build an area Listbox.
+
+        force_available_keys: area keys rendered as available (not grey) and
+            selectable even when accessible==False (Scene tab: restricted_zone).
+        disabled_keys: accessible area keys rendered unavailable/grey for this
+            tab's action (Inspect tab: INSPECT_DISABLED_AREAS).
+        selectmode: 'browse' (single) or 'extended' (multi, Inspect tab).
+
+        Ordering rule: all available rows first, then all unavailable rows —
+        never interleaved (order within each group preserves node.area_items).
+        A per-list row -> area_items index map is stored on the widget as
+        area_list._row_to_gidx so callbacks resolve selections after reordering.
+        """
+        if force_available_keys is None:
+            force_available_keys = set()
+        if disabled_keys is None:
+            disabled_keys = set()
         frame = ttk.LabelFrame(parent, text='Areas')
-        area_list = tk.Listbox(frame, activestyle='dotbox', exportselection=False)
+        area_list = tk.Listbox(frame, activestyle='dotbox', exportselection=False,
+                               selectmode=selectmode)
         area_list.pack(side='left', fill='both', expand=True)
         scrollbar = ttk.Scrollbar(frame, orient='vertical', command=area_list.yview)
         scrollbar.pack(side='right', fill='y')
@@ -281,15 +319,21 @@ class TaskGui:
             area_list.bind('<<ListboxSelect>>', select_callback)
         if double_callback:
             area_list.bind('<Double-Button-1>', double_callback)
-        for index, (key, area) in enumerate(self.node.area_items, start=1):
+
+        # Available first, unavailable last (stable within each group).
+        indexed = list(enumerate(self.node.area_items))
+        avail = [t for t in indexed
+                 if self._area_available(t[1][0], t[1][1], force_available_keys, disabled_keys)]
+        unavail = [t for t in indexed
+                   if not self._area_available(t[1][0], t[1][1], force_available_keys, disabled_keys)]
+        area_list._row_to_gidx = []
+        for row, (gidx, (key, area)) in enumerate(avail + unavail, start=1):
             name = area.get('display_name', key)
-            center = area.get('center', ['?', '?'])
-            if area.get('accessible', True):
-                label = f'{index:02d}. {key} | {name} | ({center[0]}, {center[1]})'
-                area_list.insert('end', label)
-            else:
-                area_list.insert('end', f'{index:02d}. {key} | {name} | (walled off)')
+            # Task 3: name only (no coordinate tail).
+            area_list.insert('end', f'{row:02d}. {key} | {name}')
+            if not self._area_available(key, area, force_available_keys, disabled_keys):
                 area_list.itemconfig('end', foreground='gray60')
+            area_list._row_to_gidx.append(gidx)
         return frame, area_list
 
     def _build_nav_tab(self):
@@ -319,22 +363,45 @@ class TaskGui:
     def _build_inspect_tab(self):
         body = ttk.Frame(self.inspect_tab)
         body.pack(fill='both', expand=True)
+        # Task 2.4 multi-select; Task 2.1 disabled areas (greyed + sunk to the end
+        # by _build_area_list's ordering rule, so no available/disabled interleave).
         list_frame, self.inspect_area_list = self._build_area_list(
             body,
             select_callback=None,
             double_callback=lambda _event: self.add_selected_area_to_route(),
+            disabled_keys=INSPECT_DISABLED_AREAS,
+            selectmode='extended',
         )
         list_frame.pack(side='left', fill='both', expand=True)
 
+        # Task 2.4: "Select All" button beneath the area list.
+        select_all_btn = ttk.Button(list_frame, text='Select All',
+                                    command=self._inspect_select_all)
+        select_all_btn.pack(fill='x', padx=4, pady=(2, 4))
+
         right = ttk.Frame(body)
         right.pack(side='left', fill='both', expand=True, padx=(10, 0))
+
+        # Task 2.3: replace single-line Entry with multi-line Text + Scrollbar.
         route_frame = ttk.LabelFrame(right, text='Target Rooms')
         route_frame.pack(fill='x')
-        ttk.Entry(route_frame, textvariable=self.inspect_route_var).pack(fill='x', padx=6, pady=6)
+        route_text_frame = ttk.Frame(route_frame)
+        route_text_frame.pack(fill='x', padx=6, pady=6)
+        self._route_text = tk.Text(route_text_frame, height=3, wrap='word', width=30)
+        self._route_text.pack(side='left', fill='x', expand=True)
+        route_text_scroll = ttk.Scrollbar(route_text_frame, orient='vertical',
+                                           command=self._route_text.yview)
+        route_text_scroll.pack(side='right', fill='y')
+        self._route_text.configure(yscrollcommand=route_text_scroll.set)
+        # Task 2.3: the Text stays editable (hand-typed routes are honoured via
+        # get_route()); Add Selected / Clear route through set_route().
         route_buttons = ttk.Frame(route_frame)
         route_buttons.pack(fill='x', padx=6, pady=(0, 6))
-        ttk.Button(route_buttons, text='Add Selected', command=self.add_selected_area_to_route).pack(side='left')
-        ttk.Button(route_buttons, text='Clear', command=lambda: self.inspect_route_var.set('')).pack(side='left', padx=(6, 0))
+        ttk.Button(route_buttons, text='Add Selected',
+                   command=self.add_selected_area_to_route).pack(side='left')
+        ttk.Button(route_buttons, text='Clear',
+                   command=lambda: self.set_route('')).pack(
+                       side='left', padx=(6, 0))
 
         mode_frame = ttk.LabelFrame(right, text='Dispatch Mode')
         mode_frame.pack(fill='x', pady=(10, 0))
@@ -347,30 +414,58 @@ class TaskGui:
 
         params = ttk.LabelFrame(right, text='Parameters')
         params.pack(fill='x', pady=(10, 0))
+        # Task 2.2: bilingual description labels next to each parameter entry.
+        small_font = ('TkDefaultFont', 8)
+        grey = '#555555'
         self._entry_row(params, 0, 'Max Attempts', self.max_attempts_var)
+        ttk.Label(params, text='每个区域最多尝试的候选观测点数 / max candidate viewpoints tried per area',
+                  font=small_font, foreground=grey).grid(
+                      row=0, column=2, sticky='w', padx=(0, 4), pady=3)
         self._entry_row(params, 1, 'Spread Ratio', self.spread_ratio_var)
-        ttk.Checkbutton(params, text='Return Home', variable=self.return_home_var).grid(
-            row=2, column=0, columnspan=2, sticky='w', pady=4)
+        ttk.Label(params, text='候选点偏离区域中心的扩散比例 / how far candidates spread from area center',
+                  font=small_font, foreground=grey).grid(
+                      row=1, column=2, sticky='w', padx=(0, 4), pady=3)
+        return_home_row = ttk.Frame(params)
+        return_home_row.grid(row=2, column=0, columnspan=3, sticky='w', pady=4)
+        ttk.Checkbutton(return_home_row, text='Return Home',
+                        variable=self.return_home_var).pack(side='left')
+        ttk.Label(return_home_row,
+                  text='  巡检后机器人是否自动返回各自充电桩 / whether robots auto-return to docks after inspection',
+                  font=small_font, foreground=grey).pack(side='left')
 
         buttons = ttk.Frame(right)
         buttons.pack(fill='x', pady=(10, 0))
-        ttk.Button(buttons, text='Start Inspection', command=self.start_inspection).pack(side='left')
+        ttk.Button(buttons, text='Start Inspection',
+                   command=self.start_inspection).pack(side='left')
         ttk.Button(buttons, text='Abort & Reset to Dock',
                    command=self.abort_and_reset_to_dock).pack(side='left', padx=(8, 0))
-        ttk.Button(buttons, text='Open Report Dir', command=self.set_report_dir_status).pack(side='left', padx=(8, 0))
+        ttk.Button(buttons, text='Open Report Dir',
+                   command=self.set_report_dir_status).pack(side='left', padx=(8, 0))
 
+        # Task 2.3: replace stacked Labels with one scrollable Text widget.
         report = ttk.LabelFrame(right, text='Inspection Status')
         report.pack(fill='both', expand=True, pady=(10, 0))
-        ttk.Label(report, textvariable=self.inspect_status_var).pack(anchor='w', padx=6, pady=(6, 0))
-        ttk.Label(report, textvariable=self.latest_report_var, wraplength=420).pack(anchor='w', padx=6, pady=(4, 6))
-        # Anomalies in red: plain tk.Label because ttk.Label has no fg option.
-        tk.Label(report, textvariable=self.anomaly_var, fg='#cc0000',
-                 justify='left', wraplength=420).pack(anchor='w', padx=6, pady=(0, 6))
+        status_text_frame = ttk.Frame(report)
+        status_text_frame.pack(fill='both', expand=True, padx=6, pady=6)
+        self._status_text = tk.Text(status_text_frame, height=7, wrap='word',
+                                    state='disabled')
+        self._status_text.pack(side='left', fill='both', expand=True)
+        status_scroll = ttk.Scrollbar(status_text_frame, orient='vertical',
+                                      command=self._status_text.yview)
+        status_scroll.pack(side='right', fill='y')
+        self._status_text.configure(yscrollcommand=status_scroll.set)
+        # Red tag for anomaly lines.
+        self._status_text.tag_configure('anomaly', foreground='#cc0000')
+        # Task 2.3/4: single source of truth for the status box; every refresh
+        # re-renders from this snapshot so there is exactly one render path.
+        self._status_state = {
+            'status': 'Ready', 'report': '', 'allocation_lines': None, 'anomaly': ''}
 
     def _build_scene_tab(self):
         top = ttk.Frame(self.scene_tab)
         top.pack(fill='both', expand=True)
 
+        # Task 1.2(b): build model list; grey and block non-allowed models.
         model_frame = ttk.LabelFrame(top, text='Models')
         model_frame.pack(side='left', fill='both', expand=True)
         self.model_list = tk.Listbox(model_frame, exportselection=False, height=10)
@@ -378,11 +473,26 @@ class TaskGui:
         model_scroll = ttk.Scrollbar(model_frame, orient='vertical', command=self.model_list.yview)
         model_scroll.pack(side='right', fill='y')
         self.model_list.configure(yscrollcommand=model_scroll.set)
-        for model in self.node.models:
+        # Ordering rule: allowed (importable) models first, greyed non-allowed
+        # last — never interleaved. _row_to_midx maps display rows back to
+        # node.models indices for on_model_select / default selection.
+        indexed = list(enumerate(self.node.models))
+        ordered = ([t for t in indexed if t[1]['key'] in ALLOWED_SCENE_MODELS]
+                   + [t for t in indexed if t[1]['key'] not in ALLOWED_SCENE_MODELS])
+        self.model_list._row_to_midx = []
+        for midx, model in ordered:
             self.model_list.insert('end', model['key'])
+            if model['key'] not in ALLOWED_SCENE_MODELS:
+                self.model_list.itemconfig('end', foreground='gray60')
+            self.model_list._row_to_midx.append(midx)
         self.model_list.bind('<<ListboxSelect>>', self.on_model_select)
 
-        area_frame, self.scene_area_list = self._build_area_list(top, select_callback=self.on_scene_area_select)
+        # Task 1.1: pass force_available_keys so restricted_zone renders normally.
+        area_frame, self.scene_area_list = self._build_area_list(
+            top,
+            select_callback=self.on_scene_area_select,
+            force_available_keys={'restricted_zone'},
+        )
         area_frame.pack(side='left', fill='both', expand=True, padx=(10, 0))
 
         controls = ttk.LabelFrame(self.scene_tab, text='Placement')
@@ -394,24 +504,37 @@ class TaskGui:
         self._entry_row(controls, 2, 'Yaw', self.yaw_var)
         self._entry_row(controls, 2, 'Random Margin', self.margin_var, column=2)
 
+        # Task 1.3: only Area Center and Random In Area; Manual + Allow Renaming
+        # + Dry Run widgets are intentionally omitted.
         mode = ttk.Frame(controls)
         mode.grid(row=3, column=0, columnspan=6, sticky='w', pady=(8, 0))
         ttk.Radiobutton(mode, text='Area Center', variable=self.placement_var, value='center',
                         command=self.apply_placement).pack(side='left')
         ttk.Radiobutton(mode, text='Random In Area', variable=self.placement_var, value='random',
                         command=self.apply_placement).pack(side='left', padx=(10, 0))
-        ttk.Radiobutton(mode, text='Manual', variable=self.placement_var, value='manual').pack(side='left', padx=(10, 0))
-        ttk.Checkbutton(mode, text='Allow Renaming', variable=self.allow_renaming_var).pack(side='left', padx=(20, 0))
+        # allow_renaming_var remains (default False); no widget is shown.
+        # placement_var 'manual' value still works if set programmatically.
 
         buttons = ttk.Frame(self.scene_tab)
         buttons.pack(fill='x', pady=(10, 0))
         ttk.Button(buttons, text='Use Center', command=self.use_center).pack(side='left')
         ttk.Button(buttons, text='Randomize', command=self.use_random).pack(side='left', padx=(8, 0))
-        ttk.Button(buttons, text='Dry Run', command=self.dry_run_spawn).pack(side='right')
+        # Task 1.3: Dry Run button is hidden (dry_run_spawn method kept but unused).
         ttk.Button(buttons, text='Spawn', command=self.spawn).pack(side='right', padx=(0, 8))
         ttk.Label(self.scene_tab, textvariable=self.scene_status_var).pack(fill='x', pady=(8, 0))
 
-        if self.node.models:
+        # Task 1.2(b): default to the first allowed (box) row. With allowed-first
+        # ordering that is the leading row whenever any allowed model exists.
+        first_allowed_row = next(
+            (row for row, midx in enumerate(self.model_list._row_to_midx)
+             if self.node.models[midx]['key'] in ALLOWED_SCENE_MODELS), None)
+        if first_allowed_row is not None:
+            midx = self.model_list._row_to_midx[first_allowed_row]
+            self.model_list.selection_set(first_allowed_row)
+            self.model_var.set(self.node.models[midx]['key'])
+            self.name_var.set(unique_entity_name(
+                self.node.models[midx]['key'], self.spawn_count + 1))
+        elif self.node.models:
             self.model_list.selection_set(0)
             self.on_model_select()
         if self.node.area_items:
@@ -427,7 +550,11 @@ class TaskGui:
         selection = area_list.curselection()
         if not selection:
             raise ValueError('Select a semantic area')
-        return selection[0], self.node.area_items[selection[0]]
+        # Display order is reordered (available-first); map the row back to the
+        # global area_items index. Returns the global index so nav's typed-number
+        # contract (target_var -> resolve_target) stays correct.
+        gidx = area_list._row_to_gidx[selection[0]]
+        return gidx, self.node.area_items[gidx]
 
     def on_nav_area_select(self, _event=None):
         try:
@@ -504,20 +631,112 @@ class TaskGui:
         future.add_done_callback(lambda _future: self.status_var.set('Cancel requested'))
 
     def add_selected_area_to_route(self):
-        try:
-            _index, (key, area) = self.selected_area_from_list(self.inspect_area_list)
-        except ValueError as exc:
-            messagebox.showerror('Route Error', str(exc))
+        """Add all currently-selected inspect-area rows to the route.
+
+        Task 2.1: rejects INSPECT_DISABLED_AREAS with a messagebox.
+        Task 2.4: iterates curselection() so all rows selected in extended mode
+                  are appended in one call; no duplicates.
+        """
+        selection = self.inspect_area_list.curselection()
+        if not selection:
+            messagebox.showerror('Route Error', 'Select a semantic area')
             return
-        if not area.get('accessible', True):
-            messagebox.showerror('Route Error', f'{key} is walled off in the current map')
-            return
-        current = [item.strip() for item in self.inspect_route_var.get().split(',') if item.strip()]
-        current.append(key)
-        self.inspect_route_var.set(','.join(current))
+        current = [item.strip() for item in self.get_route().split(',') if item.strip()]
+        blocked = []
+        for row in selection:
+            gidx = self.inspect_area_list._row_to_gidx[row]
+            key, area = self.node.area_items[gidx]
+            if not area.get('accessible', True):
+                blocked.append(f'{key} (walled off)')
+                continue
+            if key in INSPECT_DISABLED_AREAS:
+                # Task 2.1: show one combined error at the end rather than per-item.
+                blocked.append(f'{key} (not inspectable)')
+                continue
+            if key not in current:
+                current.append(key)
+        if blocked:
+            messagebox.showerror(
+                'Route Error',
+                'The following areas cannot be added:\n' + '\n'.join(blocked))
+        self.set_route(','.join(current))
+
+    # ------------------------------------------------------------------
+    # Task 2.3: Target Rooms route accessors (_route_text is canonical, so a
+    # hand-typed route is honoured as well as one built via the buttons).
+    # ------------------------------------------------------------------
+
+    def get_route(self) -> str:
+        """Canonical, normalized route string read from the editable Text.
+
+        Newlines and ';' are treated as ',' so a multi-line/hand-typed route
+        still resolves to a clean comma-separated list."""
+        raw = self._route_text.get('1.0', 'end')
+        parts = [p.strip() for p in
+                 raw.replace('\n', ',').replace(';', ',').split(',') if p.strip()]
+        return ','.join(parts)
+
+    def set_route(self, value: str):
+        """Replace the Target Rooms Text content (canonical route store)."""
+        self._route_text.delete('1.0', 'end')
+        if value:
+            self._route_text.insert('1.0', value)
+
+    # ------------------------------------------------------------------
+    # Task 2.3/4: single Inspection Status render path. Callers pass only the
+    # parts they changed; unspecified parts (None) keep their prior value, and
+    # the whole box is re-rendered from self._status_state every time.
+    # ------------------------------------------------------------------
+
+    def _update_inspect_status(self, status: str | None = None,
+                               report: str | None = None,
+                               allocation_lines: list | None = None,
+                               anomaly_text: str | None = None):
+        st = self._status_state
+        if status is not None:
+            st['status'] = status
+            self.inspect_status_var.set(status)
+        if report is not None:
+            st['report'] = report
+            self.latest_report_var.set(report)
+        if allocation_lines is not None:
+            st['allocation_lines'] = allocation_lines
+        if anomaly_text is not None:
+            st['anomaly'] = anomaly_text
+            self.anomaly_var.set(anomaly_text)
+
+        self._status_text.configure(state='normal')
+        self._status_text.delete('1.0', 'end')
+        if st['status']:
+            self._status_text.insert('end', st['status'] + '\n')
+        if st['report']:
+            self._status_text.insert('end', st['report'] + '\n')
+        if st['allocation_lines']:
+            self._status_text.insert('end', '本次分配 / Allocation:\n')
+            for line in st['allocation_lines']:
+                self._status_text.insert('end', '  ' + line + '\n')
+        if st['anomaly']:
+            self._status_text.insert('end', st['anomaly'] + '\n', 'anomaly')
+        self._status_text.see('end')
+        self._status_text.configure(state='disabled')
+
+    # ------------------------------------------------------------------
+    # Task 2.4: Select All helper for Inspect tab
+    # ------------------------------------------------------------------
+
+    def _inspect_select_all(self):
+        """Select every inspectable row (accessible and not in INSPECT_DISABLED_AREAS).
+
+        With available-first ordering these are the leading rows, but we map each
+        display row via _row_to_gidx so it is correct regardless of order."""
+        self.inspect_area_list.selection_clear(0, 'end')
+        for row, gidx in enumerate(self.inspect_area_list._row_to_gidx):
+            key, area = self.node.area_items[gidx]
+            if area.get('accessible', True) and key not in INSPECT_DISABLED_AREAS:
+                self.inspect_area_list.selection_set(row)
 
     def start_inspection(self):
-        route = self.inspect_route_var.get().strip()
+        route = self.get_route().strip()
         if not route:
             messagebox.showerror('Inspection Error', 'Route is empty')
             return
@@ -547,15 +766,20 @@ class TaskGui:
             log_file = open(log_path, 'w', encoding='utf-8')
             # start_new_session: own process group, so Abort can kill the
             # allocator AND the runner subprocesses it spawns (os.killpg).
+            # Task 4: PYTHONUNBUFFERED=1 so allocation lines appear in the log
+            # without waiting for the process to flush.
             self.inspect_processes['__auto__'] = subprocess.Popen(
                 command, stdout=log_file, stderr=subprocess.STDOUT, text=True,
-                start_new_session=True)
+                start_new_session=True,
+                env={**os.environ, 'PYTHONUNBUFFERED': '1'})
             self.inspect_logs['__auto__'] = (log_file, log_path)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror('Inspection Error', str(exc))
             return
-        self.inspect_status_var.set('[auto] allocating route across robots')
-        self.latest_report_var.set('')
+        # Task 4: reset the allocation-shown flag for this new run.
+        self._allocation_shown = False
+        self._update_inspect_status(
+            status='[auto] allocating route across robots', report='')
 
     def start_manual_inspection(self, route: str):
         ns = self.node.active_robot
@@ -599,21 +823,50 @@ class TaskGui:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror('Inspection Error', str(exc))
             return
-        self.inspect_status_var.set(f'[{label}] inspection running')
-        self.latest_report_var.set('')
+        # Task 4: immediately show the robot -> route allocation in manual mode.
+        self._update_inspect_status(
+            status=f'[{label}] inspection running',
+            report='',
+            allocation_lines=[f'{label} -> {route}'])
 
     def poll_inspection(self):
+        # -- Anomaly updates (Task 2.3: rendered in red via Text tag) ----------
         events = self.node.anomaly_events
-        if len(events) != self._anomaly_seen:
-            self._anomaly_seen = len(events)
+        anomaly_text = ''
+        if events:
             lines = [
                 '⚠ %s @ %s (%.2f, %.2f)' % (
                     e.get('robot', '?'), e.get('area', '?'),
                     float(e.get('x', 0.0)), float(e.get('y', 0.0)))
                 for e in events[-3:]
             ]
-            self.anomaly_var.set(
-                'Anomalies: %d\n%s' % (len(events), '\n'.join(lines)))
+            anomaly_text = 'Anomalies: %d\n%s' % (len(events), '\n'.join(lines))
+        if len(events) != self._anomaly_seen:
+            self._anomaly_seen = len(events)
+            # Single render path: update only the anomaly part of the snapshot.
+            self._update_inspect_status(anomaly_text=anomaly_text)
+
+        # -- Task 4: while __auto__ is still running, show allocation lines ----
+        auto_proc = self.inspect_processes.get('__auto__')
+        if auto_proc and auto_proc.poll() is None and not self._allocation_shown:
+            _lf, log_path = self.inspect_logs.get('__auto__', (None, None))
+            if log_path and log_path.exists():
+                try:
+                    raw = log_path.read_text(encoding='utf-8', errors='replace')
+                    alloc_lines = [
+                        line.split('Allocation:', 1)[1].strip()
+                        for line in raw.splitlines() if 'Allocation:' in line
+                    ]
+                    if alloc_lines:
+                        self._allocation_shown = True
+                        self._update_inspect_status(
+                            status='[auto] inspection running — allocation received',
+                            allocation_lines=alloc_lines,
+                            anomaly_text=anomaly_text)
+                except OSError:
+                    pass
+
+        # -- Process completion -----------------------------------------------
         for ns, process in list(self.inspect_processes.items()):
             if process is None:
                 continue
@@ -627,20 +880,30 @@ class TaskGui:
             if log_path and log_path.exists():
                 output = log_path.read_text(encoding='utf-8', errors='replace')
             label = 'auto' if ns == '__auto__' else (ns or 'root')
-            self.inspect_status_var.set(f'[{label}] inspection finished: code {return_code}')
+            status_msg = f'[{label}] inspection finished: code {return_code}'
             if ns == '__auto__':
                 mission_report = ''
                 for line in output.splitlines():
                     if 'Mission report written:' in line:
                         mission_report = line.split(
                             'Mission report written:', 1)[1].strip()
-                allocation = [line.split('Allocation:', 1)[1].strip()
-                              for line in output.splitlines() if 'Allocation:' in line]
-                self.latest_report_var.set(
-                    mission_report or ' | '.join(allocation) or output.strip()[-300:])
+                alloc_lines = [
+                    line.split('Allocation:', 1)[1].strip()
+                    for line in output.splitlines() if 'Allocation:' in line
+                ]
+                report_str = (mission_report or ' | '.join(alloc_lines)
+                              or output.strip()[-300:])
+                self._update_inspect_status(
+                    status=status_msg,
+                    report=report_str,
+                    allocation_lines=alloc_lines if alloc_lines else None,
+                    anomaly_text=anomaly_text)
             else:
                 report_line = self.extract_report_line(output)
-                self.latest_report_var.set(report_line or output.strip()[-300:])
+                self._update_inspect_status(
+                    status=status_msg,
+                    report=report_line or output.strip()[-300:],
+                    anomaly_text=anomaly_text)
             self.inspect_processes[ns] = None
         self.root.after(500, self.poll_inspection)
 
@@ -651,7 +914,9 @@ class TaskGui:
         return ''
 
     def set_report_dir_status(self):
-        self.latest_report_var.set(str(self.node.get_parameter('report_dir').value))
+        report_dir = str(self.node.get_parameter('report_dir').value)
+        self.latest_report_var.set(report_dir)
+        self._update_inspect_status(report=report_dir)
 
     def selected_scene_area(self):
         _index, pair = self.selected_area_from_list(self.scene_area_list)
@@ -661,7 +926,11 @@ class TaskGui:
         selection = self.model_list.curselection()
         if not selection:
             return
-        model_key = self.node.models[selection[0]]['key']
+        model_key = self.node.models[self.model_list._row_to_midx[selection[0]]]['key']
+        # Task 1.2(b): silently reject selection of non-allowed models.
+        if model_key not in ALLOWED_SCENE_MODELS:
+            self.model_list.selection_clear(0, 'end')
+            return
         self.model_var.set(model_key)
         self.name_var.set(unique_entity_name(model_key, self.spawn_count + 1))
 
@@ -822,8 +1091,8 @@ class TaskGui:
             messagebox.showerror('Reset Error', str(exc))
             return
         marked = f' (marked {run_dir.name} aborted)' if run_dir is not None else ''
-        self.inspect_status_var.set(
-            f'Aborted; resetting all robots to docks…{marked}')
+        self._update_inspect_status(
+            status=f'Aborted; resetting all robots to docks…{marked}')
 
     def close(self):
         for process in self.inspect_processes.values():
