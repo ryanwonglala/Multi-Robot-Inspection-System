@@ -47,6 +47,12 @@ STATUS_TEXT = {
 # added to an inspection route (GUI-only restriction; world_model.yaml unchanged).
 INSPECT_DISABLED_AREAS = {'mother_base', 'charging_station', 'server_door'}
 
+# Areas that are not valid scene-placement targets and must render greyed/
+# unselectable in the Scene tab — same treatment as the walled-off Lab/Prep
+# rooms (which are accessible==False in world_model.yaml). These three are
+# infrastructure markers, not placement zones (GUI-only; world_model unchanged).
+SCENE_DISABLED_AREAS = {'mother_base', 'charging_station', 'restricted_gate'}
+
 # Task 1.2: The only models that can be selected in the Scene tab.
 # Spawnable shapes for robustness validation. Boxes keep all three sizes
 # (0.25 / 0.45 / 0.70 m). Cylinder/cone/sphere are large-only (0.20 m) — the
@@ -495,10 +501,13 @@ class TaskGui:
         self.model_list.bind('<<ListboxSelect>>', self.on_model_select)
 
         # Task 1.1: pass force_available_keys so restricted_zone renders normally.
+        # SCENE_DISABLED_AREAS grey out the infrastructure markers (mother_base,
+        # charging_station, restricted_gate) just like the walled-off Lab/Prep.
         area_frame, self.scene_area_list = self._build_area_list(
             top,
             select_callback=self.on_scene_area_select,
             force_available_keys={'restricted_zone'},
+            disabled_keys=SCENE_DISABLED_AREAS,
         )
         area_frame.pack(side='left', fill='both', expand=True, padx=(10, 0))
 
