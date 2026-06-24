@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import math
 from pathlib import Path
+import shutil
 import subprocess
 import time
 
@@ -349,6 +350,15 @@ class TaskAllocator(Node):
                     'evidence_dir': a.get('evidence_dir'),
                     **({'reason': a['reason']} if a.get('reason') else {}),
                 } for a in data.get('areas', [])]
+                # Carry the anomaly list (with a friendly display_name resolved
+                # from the area map) so the mission report can summarise count +
+                # location at the top and relocate the evidence images.
+                dn_map = {a.get('area'): a.get('display_name')
+                          for a in data.get('areas', [])}
+                entry['anomalies'] = [
+                    {**an, 'display_name': dn_map.get(an.get('area'), an.get('area'))}
+                    for an in data.get('anomalies', [])
+                ]
                 entry['detail_report'] = str(report_file)
             if not return_enabled:
                 entry['return_home'] = 'disabled'
@@ -374,6 +384,14 @@ class TaskAllocator(Node):
         }
         mission_dir.mkdir(parents=True, exist_ok=True)
 
+        # Aggregate every robot's anomalies into one mission-level list and copy
+        # each evidence image into a single `anomaly_evidence/` folder (sibling
+        # of mission_report.md) for one-stop review. Record count + list on the
+        # mission dict so they surface in both files.
+        anomalies = self._collect_anomaly_evidence(mission_dir, robots)
+        mission['mission']['anomaly_count'] = len(anomalies)
+        mission['anomalies'] = anomalies
+
         # Task 5.3 — two-file mission report layout: mission_details.yaml (machine) +
         # mission_report.md (bilingual Markdown). report.yaml is no longer written.
 
@@ -383,18 +401,56 @@ class TaskAllocator(Node):
             yaml.safe_dump(mission, f, sort_keys=False, allow_unicode=True)
 
         # File 2: bilingual Markdown mission summary.
-        md_path = self._write_mission_markdown(mission, mission_dir, robots)
+        md_path = self._write_mission_markdown(mission, mission_dir, robots, anomalies)
 
         # Retention: keep only the 10 newest missions.
         prune_report_dirs(mission_dir.parent, 'mission_*', keep=10)
 
         return md_path
 
+    def _collect_anomaly_evidence(self, mission_dir: Path, robots: dict) -> list[dict]:
+        """Copy every anomaly's evidence photo into one mission-level
+        `anomaly_evidence/` folder (sibling of mission_report.md) so a reviewer
+        can browse all visual anomalies in one place instead of digging through
+        each robot's per-area scan folders, where evidence sits mixed in with
+        the routine 360° capture frames.
+
+        Originals are left untouched as the full per-robot record (copy, not
+        move). Returns a flat, ordered anomaly list; each item records the
+        relocated path relative to mission_dir (so the Markdown can link it).
+        """
+        collected: list[dict] = []
+        evidence_root = mission_dir / 'anomaly_evidence'
+        for ns, entry in robots.items():
+            for an in entry.get('anomalies', []):
+                seq = len(collected) + 1
+                record = {
+                    'index': seq,
+                    'robot': ns,
+                    'area': an.get('area'),
+                    'display_name': an.get('display_name') or an.get('area'),
+                    'x': an.get('x'),
+                    'y': an.get('y'),
+                    'extent': an.get('extent'),
+                    'source_photo': an.get('evidence_photo'),
+                }
+                src = an.get('evidence_photo')
+                if src and Path(src).is_file():
+                    evidence_root.mkdir(parents=True, exist_ok=True)
+                    src_path = Path(src)
+                    dest_name = f'{seq:02d}_{ns}_{an.get("area")}_{src_path.name}'
+                    dest = evidence_root / dest_name
+                    shutil.copy2(src_path, dest)
+                    record['evidence_file'] = str(dest.relative_to(mission_dir))
+                collected.append(record)
+        return collected
+
     def _write_mission_markdown(
         self,
         mission: dict,
         mission_dir: Path,
         robots: dict,
+        anomalies: list[dict] | None = None,
     ) -> Path:
         """Render a simplified bilingual Markdown mission report.
 
@@ -413,16 +469,41 @@ class TaskAllocator(Node):
             'completed_with_failures': '完成但有失败项 / Completed with failures',
         }
         status_label = STATUS_MAP.get(status, status)
+        anomalies = anomalies or []
 
         lines: list[str] = []
         lines.append('# RoboInspect 联合巡检报告 / Mission Report\n')
 
         lines.append('## 概要 / Summary\n')
         lines.append(f'- **整体状态 / Overall status**: `{status_label}`')
+        lines.append(f'- **发现异常 / Anomalies found**: {len(anomalies)}')
         lines.append(f'- **生成时间 / Generated at**: {generated_at}')
         lines.append(f'- **任务时长 / Duration**: {duration_sec} s')
         if route_requested:
             lines.append(f'- **请求路线 / Requested route**: {", ".join(f"`{r}`" for r in route_requested)}')
+        lines.append('')
+
+        # Anomalies up front: count + location of each, with a link to the
+        # relocated evidence image under anomaly_evidence/.
+        lines.append('## 异常 / Anomalies\n')
+        if anomalies:
+            lines.append('> 所有异常证据图片已汇总至 `anomaly_evidence/` 目录,便于集中查看。')
+            lines.append('> All anomaly evidence images are collected under `anomaly_evidence/` for one-stop review.\n')
+            lines.append('| # | 机器人 / Robot | 位置 / Location | 坐标 / Coords (x, y) | 证据 / Evidence |')
+            lines.append('|---|---|---|---|---|')
+            for a in anomalies:
+                ak = a.get('area') or ''
+                dn = a.get('display_name') or ak
+                loc = f'{dn} (`{ak}`)' if ak else dn
+                x, y = a.get('x'), a.get('y')
+                coord = (f'({x:.3f}, {y:.3f})'
+                         if isinstance(x, (int, float)) and isinstance(y, (int, float))
+                         else 'n/a')
+                ev = a.get('evidence_file')
+                ev_cell = f'`{ev}`' if ev else '_(missing / 缺失)_'
+                lines.append(f'| {a.get("index")} | {a.get("robot")} | {loc} | {coord} | {ev_cell} |')
+        else:
+            lines.append('未发现异常。 / No anomalies detected.')
         lines.append('')
 
         lines.append('## 任务分配 / Allocation\n')
@@ -464,6 +545,8 @@ class TaskAllocator(Node):
 
         lines.append('## 相关文件 / Related Files\n')
         lines.append(f'- **完整机读报告 / Full machine report**: `{mission_dir / "mission_details.yaml"}`')
+        if anomalies:
+            lines.append(f'- **异常证据目录 / Anomaly evidence folder**: `{mission_dir / "anomaly_evidence"}`')
         lines.append('')
 
         md_path = mission_dir / 'mission_report.md'
