@@ -1,22 +1,110 @@
-# Task-Driven Collaborative Multi-Robot Inspection System for Indoor Environments
+# RoboInspect — Multi-Robot Indoor Inspection System
 
-## Project Overview
+A **simulation-first** multi-robot system for autonomous indoor inspection,
+built on ROS 2 Humble. The system tasks a fleet of robots to patrol an indoor
+environment, detect environmental changes from camera imagery, localize the
+anomalies on the map, and produce an inspection report — with a future path
+toward physical robotic response using a custom mobile robot and an SO-ARM
+manipulator.
 
-This project is currently in the early concept and planning stage. Our current direction is to develop a ROS2-based indoor inspection robot system for structured indoor environments such as laboratories, corridors, storage rooms, equipment areas, and facility entrances.
+> **Status:** Mid-Term milestone. The simulation inspection workflow is
+> validated end-to-end; the two hardware platforms are under active
+> development and not yet integrated.
 
-The main idea is to build a mobile robot that can receive simple inspection tasks from users and perform basic autonomous inspection. For example, the user may ask the robot to check whether a doorway is blocked, inspect a selected area, or follow a preset patrol route. After receiving the task, the robot should be able to navigate to the target location, collect sensor data, detect simple abnormal conditions, and provide understandable feedback to the user.
+## Objective
 
-At the current stage, we plan to use a simulation-first development approach. We will first build a virtual indoor environment in Gazebo and use ROS2 as the main software framework to test navigation, sensing, and inspection logic. RViz and Nav2 may be used for map visualization, path planning, localization, and autonomous navigation. After the basic functions are verified in simulation, we hope to test part of the system on real robot hardware if time and resources allow.
+- Autonomous indoor inspection of structured spaces (labs, corridors, storage)
+- Vision-based environmental change detection
+- Map-level anomaly localization
+- Inspection report generation
+- (Future) robotic response using a custom mobile robot and SO-ARM
 
-The devices and platforms we are considering include TurtleBot3, LiDAR, camera or depth camera, Jetson, a four-wheel mobile chassis with encoders, So-Arm101 robotic arm, and possibly small 3Pi+ robots for simple exploration experiments. The main focus at this stage is to first develop a working mobile inspection prototype with clear task execution, sensor feedback, and basic reporting.
+## Workstreams
 
-The initial functions we hope to achieve include:
+The project is organized into three parallel workstreams.
 
-- Let the robot move to selected indoor locations
-- Let the robot follow a simple preset inspection route
-- Use LiDAR or camera data to check simple abnormal situations, such as blocked doorways or corridors
-- Capture basic inspection evidence, such as images
-- Provide simple real-time warning messages when an abnormal situation is detected
-- Generate a simple inspection result or report after the task is completed
+### 1 · Simulation & Inspection System  — *core workflow validated in simulation*
 
-The goal of this project is not to build a fully commercial robot at the beginning, but to create a clear and testable prototype system. Through this project, we hope to demonstrate that a ROS2-based mobile robot can understand basic inspection tasks, navigate in an indoor environment, collect useful sensor information, and report inspection results in a way that is easy for users to understand.
+Implemented in this repository under `ros_ws/`. Current capabilities:
+
+- **Multi-robot task allocation** — an inspection route is split across the
+  fleet, with one inspection process per robot (per-namespace).
+- **Autonomous viewpoint navigation** — Nav2 `NavigateToPose` drives each robot
+  to per-area inspection viewpoints.
+- **Backup viewpoint switching** — viewpoints are costmap-prescreened; when a
+  stop is blocked, generated ring candidates serve as fallbacks.
+- **Image & LiDAR acquisition** — camera frames and laser scans captured at
+  each viewpoint.
+- **Vision-based change detection** — each photo is compared against a
+  known-clean baseline from the same viewpoint; changed regions become anomaly
+  candidates.
+- **Map-level anomaly localization** — anomaly ground-contact pixels are
+  back-projected through the camera model onto the floor plane to yield map
+  coordinates, published as RViz markers.
+- **Dashboard & mission reporting** — a Tk GUI (Scene + Inspect tabs) for scene
+  setup and live monitoring, a fleet-wide anomaly bus, and generated YAML +
+  bilingual (中文/English) Markdown reports with collected evidence.
+
+*Remaining work:* anomaly response logic, dashboard refinement, sim-to-real
+deployment.
+
+### 2 · Custom Mobile Robot Platform  — *hardware integration in progress*
+
+*Completed:* chassis assembled · Jetson Nano installed · LiDAR installed ·
+depth camera installed · ROS 2 Humble configured · preliminary sensor testing.
+
+*In progress:* ROS 2 communication · SLAM · localization · autonomous
+navigation · integration with the inspection workflow.
+
+### 3 · SO-ARM Manipulation Module  — *assembly & calibration in progress*
+
+*Completed:* mechanical assembly · servo installation · controller connection ·
+leader–follower teleoperation demonstrated.
+
+*Remaining:* calibration · manipulation accuracy · predefined manipulation
+motions · integration with the mobile robot.
+
+## Repository Structure
+
+```text
+roboinspec_ws/
+├── ros_ws/              # Active simulation & inspection system (ROS 2 Humble)
+│   └── src/
+│       ├── task_layer/  # Task allocation, inspection runner, change detection,
+│       │                #   anomaly localization, reporting, operator GUI
+│       └── sim/         # Gazebo worlds + TurtleBot3 robot models, launch files
+├── archive/             # Previous archived development versions
+├── doc/                 # Project trace records / development logs
+└── reports/             # Generated inspection reports
+```
+
+## Current Project Status
+
+| Workstream                     | Status                          |
+| ------------------------------ | ------------------------------- |
+| Simulation & Inspection System | Core workflow validated         |
+| Custom Mobile Robot            | Hardware integration in progress|
+| SO-ARM                         | Assembly & calibration in progress |
+| Full System Integration        | Planned                         |
+
+## Roadmap
+
+**Completed**
+- End-to-end inspection workflow in simulation (allocate → navigate → capture →
+  detect → localize → report)
+- Mobile robot hardware assembly and preliminary sensor testing
+- SO-ARM assembly and leader–follower teleoperation
+
+**In Progress**
+- Mobile robot ROS 2 communication, SLAM, localization, autonomous navigation
+- SO-ARM calibration and manipulation accuracy
+- Dashboard refinement and anomaly response logic
+
+**Future Work**
+- Sim-to-real deployment of the inspection workflow
+- Integration of the SO-ARM with the mobile robot
+- Full multi-robot system integration (inspection + physical response)
+
+---
+
+*Simulation built on ROS 2 Humble · Nav2 · Gazebo · RViz. Mid-term milestone — not a final release.*
