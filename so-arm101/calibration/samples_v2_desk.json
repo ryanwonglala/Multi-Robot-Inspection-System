@@ -1,0 +1,340 @@
+[
+  {
+    "pixel": [
+      918.7,
+      408.7
+    ],
+    "joints": {
+      "shoulder_pan": -1.4,
+      "shoulder_lift": -3.48,
+      "elbow_flex": 45.33,
+      "wrist_flex": 43.0,
+      "wrist_roll": 3.47
+    }
+  },
+  {
+    "pixel": [
+      692.6,
+      418.6
+    ],
+    "joints": {
+      "shoulder_pan": -18.22,
+      "shoulder_lift": 4.26,
+      "elbow_flex": 33.84,
+      "wrist_flex": 44.44,
+      "wrist_roll": 3.44
+    }
+  },
+  {
+    "pixel": [
+      993.8,
+      58.6
+    ],
+    "joints": {
+      "shoulder_pan": -0.51,
+      "shoulder_lift": 49.25,
+      "elbow_flex": -37.04,
+      "wrist_flex": 74.17,
+      "wrist_roll": 3.46
+    }
+  },
+  {
+    "pixel": [
+      1444.5,
+      607.8
+    ],
+    "joints": {
+      "shoulder_pan": 29.17,
+      "shoulder_lift": 8.51,
+      "elbow_flex": 27.0,
+      "wrist_flex": 61.34,
+      "wrist_roll": 3.38
+    }
+  },
+  {
+    "pixel": [
+      1780.4,
+      987.6
+    ],
+    "joints": {
+      "shoulder_pan": 59.97,
+      "shoulder_lift": -9.51,
+      "elbow_flex": 46.1,
+      "wrist_flex": 46.14,
+      "wrist_roll": 3.46
+    }
+  },
+  {
+    "pixel": [
+      332.2,
+      338.3
+    ],
+    "joints": {
+      "shoulder_pan": -35.23,
+      "shoulder_lift": 15.06,
+      "elbow_flex": 19.12,
+      "wrist_flex": 41.46,
+      "wrist_roll": 3.04
+    }
+  },
+  {
+    "pixel": [
+      265.4,
+      917.9
+    ],
+    "joints": {
+      "shoulder_pan": -55.56,
+      "shoulder_lift": -6.19,
+      "elbow_flex": 42.69,
+      "wrist_flex": 57.65,
+      "wrist_roll": 2.91
+    }
+  },
+  {
+    "pixel": [
+      1338.4,
+      600.2
+    ],
+    "joints": {
+      "shoulder_pan": 22.85,
+      "shoulder_lift": 4.32,
+      "elbow_flex": 33.57,
+      "wrist_flex": 58.54,
+      "wrist_roll": 3.39
+    }
+  },
+  {
+    "pixel": [
+      739.2,
+      420.5
+    ],
+    "joints": {
+      "shoulder_pan": -15.47,
+      "shoulder_lift": 1.52,
+      "elbow_flex": 35.06,
+      "wrist_flex": 48.72,
+      "wrist_roll": 3.45
+    }
+  },
+  {
+    "pixel": [
+      739.5,
+      434.0
+    ],
+    "joints": {
+      "shoulder_pan": -15.57,
+      "shoulder_lift": 5.63,
+      "elbow_flex": 34.34,
+      "wrist_flex": 48.77,
+      "wrist_roll": 3.45
+    }
+  },
+  {
+    "pixel": [
+      1241.1,
+      26.3
+    ],
+    "joints": {
+      "shoulder_pan": 11.4,
+      "shoulder_lift": 54.93,
+      "elbow_flex": -45.45,
+      "wrist_flex": 70.38,
+      "wrist_roll": 3.5
+    }
+  },
+  {
+    "pixel": [
+      1577.9,
+      484.1
+    ],
+    "joints": {
+      "shoulder_pan": 32.61,
+      "shoulder_lift": 27.49,
+      "elbow_flex": 0.59,
+      "wrist_flex": 65.75,
+      "wrist_roll": 3.41
+    }
+  },
+  {
+    "pixel": [
+      1593.7,
+      732.8
+    ],
+    "joints": {
+      "shoulder_pan": 39.73,
+      "shoulder_lift": 5.41,
+      "elbow_flex": 29.73,
+      "wrist_flex": 61.34,
+      "wrist_roll": 3.41
+    }
+  },
+  {
+    "pixel": [
+      1475.7,
+      520.7
+    ],
+    "joints": {
+      "shoulder_pan": 28.88,
+      "shoulder_lift": 18.25,
+      "elbow_flex": 13.43,
+      "wrist_flex": 70.63,
+      "wrist_roll": 3.4
+    }
+  },
+  {
+    "pixel": [
+      756.5,
+      339.6
+    ],
+    "joints": {
+      "shoulder_pan": -13.2,
+      "shoulder_lift": 10.5,
+      "elbow_flex": 26.99,
+      "wrist_flex": 50.4,
+      "wrist_roll": 3.44
+    }
+  },
+  {
+    "pixel": [
+      1238.7,
+      33.8
+    ],
+    "joints": {
+      "shoulder_pan": 11.35,
+      "shoulder_lift": 52.67,
+      "elbow_flex": -42.81,
+      "wrist_flex": 71.89,
+      "wrist_roll": 3.5
+    }
+  },
+  {
+    "pixel": [
+      596.4,
+      424.1
+    ],
+    "joints": {
+      "shoulder_pan": -23.99,
+      "shoulder_lift": 4.98,
+      "elbow_flex": 34.73,
+      "wrist_flex": 46.07,
+      "wrist_roll": 3.33
+    }
+  },
+  {
+    "pixel": [
+      1771.6,
+      916.7
+    ],
+    "joints": {
+      "shoulder_pan": 54.86,
+      "shoulder_lift": -6.7,
+      "elbow_flex": 44.84,
+      "wrist_flex": 47.3,
+      "wrist_roll": 3.45
+    }
+  },
+  {
+    "pixel": [
+      1264.3,
+      77.4
+    ],
+    "joints": {
+      "shoulder_pan": 13.69,
+      "shoulder_lift": 42.35,
+      "elbow_flex": -30.84,
+      "wrist_flex": 68.53,
+      "wrist_roll": 3.49
+    }
+  },
+  {
+    "pixel": [
+      1329.1,
+      420.1
+    ],
+    "joints": {
+      "shoulder_pan": 20.16,
+      "shoulder_lift": 17.98,
+      "elbow_flex": 14.5,
+      "wrist_flex": 65.41,
+      "wrist_roll": 3.43
+    }
+  },
+  {
+    "pixel": [
+      1314.6,
+      455.1
+    ],
+    "joints": {
+      "shoulder_pan": 19.84,
+      "shoulder_lift": 14.63,
+      "elbow_flex": 19.79,
+      "wrist_flex": 60.91,
+      "wrist_roll": 3.42
+    }
+  },
+  {
+    "pixel": [
+      1317.3,
+      463.3
+    ],
+    "joints": {
+      "shoulder_pan": 20.07,
+      "shoulder_lift": 14.13,
+      "elbow_flex": 20.64,
+      "wrist_flex": 60.85,
+      "wrist_roll": 3.42
+    }
+  },
+  {
+    "pixel": [
+      1314.2,
+      461.3
+    ],
+    "joints": {
+      "shoulder_pan": 19.88,
+      "shoulder_lift": 14.14,
+      "elbow_flex": 20.59,
+      "wrist_flex": 60.75,
+      "wrist_roll": 3.42
+    }
+  },
+  {
+    "pixel": [
+      1062.1,
+      296.1
+    ],
+    "joints": {
+      "shoulder_pan": 5.38,
+      "shoulder_lift": 18.41,
+      "elbow_flex": 12.88,
+      "wrist_flex": 57.82,
+      "wrist_roll": 3.47
+    }
+  },
+  {
+    "pixel": [
+      1058.8,
+      291.8
+    ],
+    "joints": {
+      "shoulder_pan": 5.17,
+      "shoulder_lift": 18.81,
+      "elbow_flex": 12.28,
+      "wrist_flex": 60.37,
+      "wrist_roll": 3.47
+    }
+  },
+  {
+    "pixel": [
+      1059.3,
+      290.9
+    ],
+    "joints": {
+      "shoulder_pan": 5.19,
+      "shoulder_lift": 18.95,
+      "elbow_flex": 11.26,
+      "wrist_flex": 57.25,
+      "wrist_roll": 3.47
+    }
+  }
+]

@@ -1,0 +1,7 @@
+__pycache__/
+*.pt
+weights/
+.venv*/
+calibration/*.jpg
+!calibration/observe_ref.jpg
+!calibration/workzone.jpg

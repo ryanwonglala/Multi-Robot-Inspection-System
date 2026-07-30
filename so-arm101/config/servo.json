@@ -1,0 +1,25 @@
+{
+  "ref": [
+    1029.8,
+    567.6
+  ],
+  "jacobian": [
+    [
+      -19.738,
+      2.968
+    ],
+    [
+      -5.666,
+      -4.858
+    ]
+  ],
+  "joints": [
+    "shoulder_pan",
+    "elbow_flex"
+  ],
+  "hover_delta": 8.0,
+  "depth_bias": 17.6,
+  "angle_ref": 4.7,
+  "roll_gain": 0.876,
+  "roll_neutral": 3.32
+}

@@ -1,0 +1,26 @@
+{
+  "observe": {
+    "shoulder_pan": 1.0,
+    "shoulder_lift": -16.5,
+    "elbow_flex": -11.0,
+    "wrist_flex": 100.3,
+    "wrist_roll": 3.5,
+    "gripper": 1.1
+  },
+  "home": {
+    "shoulder_pan": 0.35,
+    "shoulder_lift": -82.33,
+    "elbow_flex": 96.62,
+    "wrist_flex": 45.41,
+    "wrist_roll": 3.12,
+    "gripper": 0.77
+  },
+  "drop": {
+    "shoulder_pan": 12.13,
+    "shoulder_lift": 38.9,
+    "elbow_flex": -26.73,
+    "wrist_flex": 46.46,
+    "wrist_roll": 2.95,
+    "gripper": 1.25
+  }
+}

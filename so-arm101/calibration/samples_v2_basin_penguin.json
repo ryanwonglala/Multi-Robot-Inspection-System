@@ -1,0 +1,15 @@
+[
+  {
+    "pixel": [
+      1053.1,
+      519.9
+    ],
+    "joints": {
+      "shoulder_pan": 3.15,
+      "shoulder_lift": -8.75,
+      "elbow_flex": 41.59,
+      "wrist_flex": 49.36,
+      "wrist_roll": 3.3
+    }
+  }
+]

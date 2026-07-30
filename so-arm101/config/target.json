@@ -1,0 +1,104 @@
+{
+  "name": "多目标异常物@固定白纸(参考帧差分)",
+  "hsv_lo": [
+    0,
+    0,
+    0
+  ],
+  "hsv_hi": [
+    179,
+    255,
+    90
+  ],
+  "min_area": 2500,
+  "max_area": 90000,
+  "expected_area": 30000,
+  "area_tolerance": [
+    0.55,
+    1.7
+  ],
+  "grip": 8.5,
+  "max_elongation": 4.0,
+  "posture_max_elong": 1.55,
+  "mode": "refdiff",
+  "classes": {
+    "手串": {
+      "match": {
+        "solidity_max": 0.7
+      },
+      "ref": [
+        816.8,
+        591.0
+      ],
+      "angle_ref": null,
+      "depth_delta": 12.0,
+      "grip": 8.5,
+      "hold": [
+        1.5,
+        4.5
+      ],
+      "no_roll": true
+    },
+    "笔袋": {
+      "match": {
+        "a_max": -10,
+        "b_max": 30
+      },
+      "ref": [
+        1038.1,
+        718.0
+      ],
+      "angle_ref": 89.3,
+      "depth_delta": 4.8,
+      "grip": 8.5,
+      "hold": [
+        7.0,
+        10.5
+      ],
+      "servo_hsv": [
+        [
+          35,
+          35,
+          40
+        ],
+        [
+          95,
+          255,
+          255
+        ]
+      ],
+      "grasp_joints": {
+        "shoulder_pan": 1.11,
+        "shoulder_lift": 17.48,
+        "elbow_flex": 16.54,
+        "wrist_flex": 64.43,
+        "wrist_roll": 1.2
+      }
+    },
+    "积木": {
+      "match": {
+        "l_max": 110,
+        "abs_a_max": 8
+      },
+      "ref": [
+        1052.0,
+        671.1
+      ],
+      "angle_ref": null,
+      "depth_delta": 0.0,
+      "grip": 8.5,
+      "hold": [
+        4.4,
+        16.5
+      ],
+      "no_roll": true,
+      "grasp_joints": {
+        "shoulder_pan": 8.71,
+        "shoulder_lift": 1.41,
+        "elbow_flex": 35.22,
+        "wrist_flex": 62.26,
+        "wrist_roll": 3.32
+      }
+    }
+  }
+}
