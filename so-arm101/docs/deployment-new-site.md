@@ -84,3 +84,35 @@
 ## 不变量（换场地也不变的东西）
 臂控制栈、合爪逻辑、运输编排、伺服算法、示教工具链、单位约定、
 "干净深度来自人手"原则、"物体完整摆进绿框"纪律。
+
+---
+
+# 架构修订（07-30 定）：Jetson 中控方案
+
+自制小车底座判死（不修），其 Jetson Nano Super 8G + 深度相机 + 雷达降级重组为
+**卸货区固定监督站 + 全系统中控**。论文叙事: 异构协作 + 硬件故障下的降级运行设计。
+
+## 最终拓扑
+```
+Jetson Nano Super (卸货区, Ubuntu + ROS2 Humble) —— 中控
+├─ SO-ARM101 (USB串口, SOARM_PORT=/dev/ttyACM*)   ← 臂控制栈(本仓库代码原样跑)
+├─ 腕装 WebCam (USB)                               ← camera_server 同款(无TCC之苦, 可systemd自启)
+├─ 深度相机 D436 (侧视卸货区)                       ← 第三方验收: 托盘清空判定/掉件检测/录像存证
+├─ 雷达                                            ← TB3到位触发 + 工作单元安全监护
+└─ ROS2 ←→ TB3 车队 / 巡检报告系统
+Mac: 退役为开发机 + 仪表盘(随时可回退为运行平台)
+```
+
+## 迁移清单（与新场地部署合并执行, 不重复劳动）
+1. Jetson 拉仓库 `so-arm101/`; venv + `pip install "lerobot[feetech]" opencv-python scipy matplotlib`
+   （aarch64 若 torch 装不动, 用 NVIDIA 官方 wheel; 本栈不跑神经网络, CPU torch 即可）
+2. 串口: 用户加入 dialout 组; `ls /dev/ttyACM*` 确认; `export SOARM_PORT=/dev/ttyACM0`
+3. 从 Mac 拷贝舵机标定: `~/.cache/huggingface/lerobot/calibration/robots/so_follower/main_arm.json`
+4. WebCam 接 Jetson; `camera_server.py --list` 确认 index; 可做 systemd 服务
+5. 链路验证: 01(臂连接) → 相机 → 05(观察位) → 09 单轮 —— 全通过后才进部署阶段2
+6. 二期(链路稳定后): 雷达到位触发+安全监护、D436 验收节点, 以 ROS2 节点形式挂同机,
+   与臂控制栈用本机话题/简单IPC对接
+
+## 风险与回退
+- lerobot aarch64 安装若受阻: Mac 方案完整保留, 插回 Mac 即可运行(仅 SOARM_PORT 不同)
+- Jetson 算力富余(Nano Super 8G), 阶段二 SmolVLA 推理可直接落本机(训练仍在 5070Ti)

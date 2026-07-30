@@ -21,7 +21,8 @@ def _trace(msg: str) -> None:
 from lerobot.robots.so_follower import SOFollower
 from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
 
-PORT = "/dev/cu.usbmodem5AE70447161"
+# 串口: macOS=/dev/cu.usbmodem*, Jetson/Linux=/dev/ttyACM*; 迁移时用环境变量覆盖
+PORT = os.environ.get("SOARM_PORT", "/dev/cu.usbmodem5AE70447161")
 ARM_ID = "main_arm"
 
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
