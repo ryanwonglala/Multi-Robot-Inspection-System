@@ -56,13 +56,24 @@ depth camera installed · ROS 2 Humble configured · preliminary sensor testing.
 *In progress:* ROS 2 communication · SLAM · localization · autonomous
 navigation · integration with the inspection workflow.
 
-### 3 · SO-ARM Manipulation Module  — *assembly & calibration in progress*
+### 3 · SO-ARM Vision Sorting Module  — *autonomous sorting pipeline validated (standalone)*
 
-*Completed:* mechanical assembly · servo installation · controller connection ·
-leader–follower teleoperation demonstrated.
+Implemented in this repository under `so-arm101/` (pure Python + lerobot on
+macOS, fully independent from `ros_ws/`). A fixed SO-ARM101 detects
+abnormal-colored objects in its work zone, grasps them, and drops them into a
+recycling bin — the physical-response station that the TurtleBot3 tray will
+feed.
 
-*Remaining:* calibration · manipulation accuracy · predefined manipulation
-motions · integration with the mobile robot.
+*Completed:* mechanical assembly & servo bring-up · camera-server architecture
+(macOS TCC) · reference-frame-diff detection + rule-based classification ·
+pixel→joint mapping from a human-taught grid (plane fit) · hover visual
+servoing · vertical-posture constraint · contact-stop grasping with load
+verification · transport & drop choreography · stress-test tooling with
+logged success-rate data · full worklogs and a new-site deployment guide
+(`so-arm101/docs/`).
+
+*Remaining:* uniform printed-cube targets (colors = classes) · tray-scenario
+detection switch · TB3 docking handoff · on-site deployment.
 
 ## Repository Structure
 
@@ -73,6 +84,8 @@ roboinspec_ws/
 │       ├── task_layer/  # Task allocation, inspection runner, change detection,
 │       │                #   anomaly localization, reporting, operator GUI
 │       └── sim/         # Gazebo worlds + TurtleBot3 robot models, launch files
+├── so-arm101/           # SO-ARM101 vision sorting subsystem (Python + lerobot,
+│                        #   no ROS; see so-arm101/README.md)
 ├── archive/             # Previous archived development versions
 ├── doc/                 # Project trace records / development logs
 └── reports/             # Generated inspection reports
@@ -84,7 +97,7 @@ roboinspec_ws/
 | ------------------------------ | ------------------------------- |
 | Simulation & Inspection System | Core workflow validated         |
 | Custom Mobile Robot            | Hardware integration in progress|
-| SO-ARM                         | Assembly & calibration in progress |
+| SO-ARM Vision Sorting          | Pipeline validated (standalone) |
 | Full System Integration        | Planned                         |
 
 ## Roadmap
@@ -93,16 +106,18 @@ roboinspec_ws/
 - End-to-end inspection workflow in simulation (allocate → navigate → capture →
   detect → localize → report)
 - Mobile robot hardware assembly and preliminary sensor testing
-- SO-ARM assembly and leader–follower teleoperation
+- SO-ARM autonomous sorting pipeline: detection → classification → taught-grid
+  localization → visual servoing → verified grasp → transport & drop
+  (stress-tested standalone; see `so-arm101/`)
 
 **In Progress**
 - Mobile robot ROS 2 communication, SLAM, localization, autonomous navigation
-- SO-ARM calibration and manipulation accuracy
+- SO-ARM: uniform printed-cube targets and tray-scenario detection
 - Dashboard refinement and anomaly response logic
 
 **Future Work**
 - Sim-to-real deployment of the inspection workflow
-- Integration of the SO-ARM with the mobile robot
+- TB3 tray docking + SO-ARM handoff (physical anomaly response)
 - Full multi-robot system integration (inspection + physical response)
 
 ---
