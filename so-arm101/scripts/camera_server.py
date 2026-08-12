@@ -15,6 +15,7 @@
 
 import argparse
 import json
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,19 @@ import cv2
 HOST, PORT = "127.0.0.1", 8765
 OUT_DIR = Path(__file__).parent.parent / "calibration"
 ROI_FILE = Path(__file__).parent.parent / "config" / "roi.json"
+
+
+def open_camera(index: int) -> cv2.VideoCapture:
+    """Open the webcam with the native backend for the current platform."""
+    if sys.platform == "darwin":
+        return cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+
+    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    return cap
 
 
 class RoiWatch:
@@ -50,7 +64,7 @@ def list_cameras() -> None:
     OUT_DIR.mkdir(exist_ok=True)
     found = []
     for idx in range(4):
-        cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
+        cap = open_camera(idx)
         if cap.isOpened():
             ok, frame = cap.read()
             if ok:
@@ -68,7 +82,7 @@ class FrameGrabber(threading.Thread):
 
     def __init__(self, index: int):
         super().__init__(daemon=True)
-        self.cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+        self.cap = open_camera(index)
         if not self.cap.isOpened():
             raise RuntimeError(f"无法打开相机 index={index}（确认从终端运行且已授权摄像头）")
         self.lock = threading.Lock()

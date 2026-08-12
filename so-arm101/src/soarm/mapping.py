@@ -27,6 +27,23 @@ SAMPLES_FILE = _V3 if _v3_ready() else (_V2 if _V2.exists() else _CALIB_DIR / "s
 MAP_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 
 PIXEL_SCALE = 1000.0  # 像素坐标归一化因子，改善 RBF 条件数
+FRAME_CX = 960.0      # 画面横向中心(1920/2)，横向二次项以此为对称轴
+
+_TARGET_FILE = Path(__file__).parent.parent.parent / "config" / "target.json"
+
+
+def _cfg_model() -> str:
+    """拟合模型由 config/target.json 的 mapping_model 决定, 缺省 "plane"(原行为)。
+
+    "plane"      = [1, x, y]        —— 老场地验证过的最小二乘平面
+    "plane+xc2"  = [1, x, y, xc²]   —— 增一个横向二次项(xc = x - 画面中心)
+        托盘场景实测: 伸展量随半径变化, 中间抬两侧伸, 是抛物线不是直线。
+        加此项后腕俯仰 LOO 最大误差 5.48°->3.60°, 其余关节持平(±0.2°内)。
+    """
+    try:
+        return json.loads(_TARGET_FILE.read_text()).get("mapping_model", "plane")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return "plane"
 
 
 def _load(samples_file: Path = SAMPLES_FILE):
@@ -41,10 +58,12 @@ class PixelToJoints:
     自带±2°随机余量, 逐点插值会把噪声当真理, 深度面越采越抖——实测坑)。
     样本<6: 退回 RBF 逐点插值(点太少拟合平面欠定)。"""
 
-    def __init__(self, samples_file: Path = SAMPLES_FILE, smoothing: float = 0.0):
+    def __init__(self, samples_file: Path = SAMPLES_FILE, smoothing: float = 0.0,
+                 model: str | None = None):
         px, joints = _load(samples_file)
+        self.model = model if model is not None else _cfg_model()
         if len(px) >= 6:
-            A = np.hstack([np.ones((len(px), 1)), px])  # [1, x, y]
+            A = self._design(px)
             self.coef, *_ = np.linalg.lstsq(A, joints, rcond=None)
             self.interp = None
         else:
@@ -52,10 +71,18 @@ class PixelToJoints:
             self.coef = None
             self.interp = RBFInterpolator(px, joints, kernel="linear", smoothing=smoothing)
 
+    def _design(self, px_norm: np.ndarray) -> np.ndarray:
+        """设计矩阵。px_norm 已除以 PIXEL_SCALE。"""
+        cols = [np.ones(len(px_norm)), px_norm[:, 0], px_norm[:, 1]]
+        if self.model == "plane+xc2":
+            xc = px_norm[:, 0] - FRAME_CX / PIXEL_SCALE
+            cols.append(xc * xc)
+        return np.stack(cols, axis=1)
+
     def __call__(self, pixel_x: float, pixel_y: float) -> dict[str, float]:
         p = np.array([pixel_x, pixel_y]) / PIXEL_SCALE
         if self.coef is not None:
-            q = np.array([1.0, p[0], p[1]]) @ self.coef
+            q = (self._design(p[None, :]) @ self.coef)[0]
         else:
             q = self.interp(p[None, :])[0]
         return dict(zip(MAP_JOINTS, q.tolist()))

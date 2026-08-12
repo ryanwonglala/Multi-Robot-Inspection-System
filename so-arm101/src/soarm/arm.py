@@ -53,7 +53,16 @@ def _pin_goals_to_present() -> None:
     bus = FeetechMotorsBus(port=PORT, motors=motors)
     bus.connect(handshake=False)
     for name in motors:
-        pos = bus.read("Present_Position", name, normalize=False)
+        last_exc = None
+        for attempt in range(5):
+            try:
+                pos = bus.read("Present_Position", name, normalize=False)
+                break
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.08 * (attempt + 1))
+        else:
+            raise last_exc
         bus.write("Goal_Position", name, pos, normalize=False)
     bus.disconnect(disable_torque=False)
 
@@ -204,10 +213,21 @@ def transport_to_drop(robot: SOFollower) -> None:
     # 极简三步(用户定稿): 提离桌面 -> 转体 -> 整体平滑滑入罐口悬停位。
     # 投放位=罐口上方悬停(04示教, 肩38.9/肘-26.7), 终点高、肘展开量小,
     # 整体插值中段不会低于罐口高度。松爪由调用方负责。
-    _trace("运输1: 提离")
-    smooth_goto(robot, {"shoulder_lift": max(cur["shoulder_lift"] - 20.0, -25.0)}, duration=1.2)
+    # 过渡位: poses.json 里若定义了 transit 就用绝对姿态(转体前把指尖收高收近, 减小横扫半径),
+    # 否则退回原来的相对抬肩(老场地行为不变)。绝对姿态比相对增量稳: 起点(抓取深度)会随位置变,
+    # 同一个增量在不同起点下效果不同——实测栽过。
+    try:
+        transit = load_pose("transit")
+    except KeyError:
+        transit = None
+    if transit:
+        _trace("运输1: 提离并收拢到过渡位")
+        smooth_goto(robot, dict(transit), duration=1.8)
+    else:
+        _trace("运输1: 提离")
+        smooth_goto(robot, {"shoulder_lift": max(cur["shoulder_lift"] - 20.0, -25.0)}, duration=1.2)
     _trace("运输2: 转体")
-    smooth_goto(robot, {"shoulder_pan": drop["shoulder_pan"]}, duration=2.0)
+    smooth_goto(robot, {"shoulder_pan": drop["shoulder_pan"]}, duration=2.5)
     _trace("运输3: 平滑滑入罐口悬停位")
     smooth_goto(robot, {j: drop[j] for j in
                         ("shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")},

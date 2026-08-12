@@ -1,11 +1,11 @@
 {
   "observe": {
-    "shoulder_pan": 1.0,
-    "shoulder_lift": -16.5,
-    "elbow_flex": -11.0,
-    "wrist_flex": 100.3,
-    "wrist_roll": 3.5,
-    "gripper": 1.1
+    "shoulder_pan": 1.58,
+    "shoulder_lift": -51.21,
+    "elbow_flex": 18.81,
+    "wrist_flex": 77.67,
+    "wrist_roll": -0.75,
+    "gripper": 2.37
   },
   "home": {
     "shoulder_pan": 0.35,
@@ -16,11 +16,23 @@
     "gripper": 0.77
   },
   "drop": {
-    "shoulder_pan": 12.13,
-    "shoulder_lift": 38.9,
-    "elbow_flex": -26.73,
+    "shoulder_pan": 64.97,
+    "shoulder_lift": -32.92,
+    "elbow_flex": 47.82,
     "wrist_flex": 46.46,
     "wrist_roll": 2.95,
-    "gripper": 1.25
+    "gripper": 8.78
+  },
+  "grasp_seed": {
+    "shoulder_pan": 0.44,
+    "shoulder_lift": -11.38,
+    "elbow_flex": 1.76,
+    "wrist_flex": 80.92,
+    "wrist_roll": 3.03,
+    "gripper": 24.25
+  },
+  "transit": {
+    "shoulder_lift": -39.78,
+    "elbow_flex": 18.29
   }
 }

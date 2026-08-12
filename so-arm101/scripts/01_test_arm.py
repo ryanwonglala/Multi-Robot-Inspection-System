@@ -4,7 +4,12 @@
 用法: .venv/bin/python scripts/01_test_arm.py
 """
 
-PORT = "/dev/cu.usbmodem5AE70447161"
+import os
+import sys
+
+# 串口: macOS=/dev/cu.usbmodem*, Jetson/Linux=/dev/ttyACM*; 用 SOARM_PORT 覆盖
+_DEFAULT_PORT = "/dev/ttyACM0" if sys.platform.startswith("linux") else "/dev/cu.usbmodem5AE70447161"
+PORT = os.environ.get("SOARM_PORT", _DEFAULT_PORT)
 
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus
