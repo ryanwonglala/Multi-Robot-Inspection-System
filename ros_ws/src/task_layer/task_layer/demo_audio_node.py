@@ -21,8 +21,8 @@ The four cues and the existing signals they watch:
                   returned to dock (run_until_all_home), so a single robot
                   ending its own route does NOT trigger this cue.
 
-Drop four audio files (paplay-compatible: .wav / .ogg / .flac) into
-~/roboinspec_ws/sounds/ with the names below (override via params if you like).
+The four paplay-compatible audio files are installed with the task_layer
+package (override the directory or filenames via parameters if needed).
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from rclpy.qos import (QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy,
                        QoSHistoryPolicy)
@@ -57,8 +58,9 @@ class DemoAudioNode(Node):
     def __init__(self):
         super().__init__('demo_audio_node')
         self.declare_parameter('robots', ['tb3', 'arm'])
-        self.declare_parameter('sounds_dir',
-                               str(Path.home() / 'roboinspec_ws' / 'sounds'))
+        default_sounds = (Path(get_package_share_directory('task_layer')) /
+                          'assets' / 'audio')
+        self.declare_parameter('sounds_dir', str(default_sounds))
         self.declare_parameter('ready_file', '01_ready.wav')
         self.declare_parameter('task_file', '02_task_received.wav')
         self.declare_parameter('anomaly_file', '03_anomaly.wav')

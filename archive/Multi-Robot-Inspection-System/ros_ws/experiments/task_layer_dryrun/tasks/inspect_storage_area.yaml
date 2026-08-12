@@ -1,5 +1,0 @@
-task:
-  type: inspect_area
-  target: storage_area
-  require_image: true
-  priority: normal

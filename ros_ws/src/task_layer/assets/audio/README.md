@@ -1,7 +1,7 @@
-# Demo audio cues (feat/live-demo-tweaks)
+# Demo audio cues
 
-Played by the sidecar node `task_layer/demo_audio_node.py`. Drop four audio
-files here with these exact names (override via params if needed):
+Played by the sidecar node `task_layer/demo_audio_node.py`. The four packaged
+audio files live in this directory (override via params if needed):
 
 | File | Plays when |
 |------|-----------|

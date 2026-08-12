@@ -68,8 +68,9 @@ navigation and AprilTag gates. One low-battery trial stopped during the final
 reverse step (`odom_stop`), so docking still requires an operator check and a
 healthy-battery preflight. Site maps, camera images, device calibration, and
 network runbooks are intentionally kept outside this public repository. The
-earlier Wave Rover experiments are preserved in `ugv02_archive/` and are not
-the primary production path.
+reusable, namespaced UGV driver is maintained in
+`ros_ws/src/ugv_base_driver/`; superseded hardware experiments remain
+available through Git history instead of cluttering the final source tree.
 
 ### 3 · SO-ARM Vision Sorting Module  — *autonomous sorting pipeline validated (standalone)*
 
@@ -105,11 +106,16 @@ roboinspec_ws/
 ├── jetson_realsense_gate/ # Jetson RGB-D safety and load-detection gate
 ├── so-arm101/           # SO-ARM101 vision sorting subsystem (Python + lerobot,
 │                        #   no ROS; see so-arm101/README.md)
-├── ugv02_archive/       # Preserved Wave Rover commissioning implementation
-├── archive/             # Earlier project versions
-├── markers/             # RViz anomaly-marker runtime assets
-└── sounds/              # Optional final-demo audio cues
+└── README.md            # Project status, scope and entry points
 ```
+
+## Documentation
+
+- `ros_ws/doc/COMMANDS.md` — common build and operation commands.
+- `ros_ws/doc/TROUBLESHOOTING.md` — consolidated failure modes, fixes, known
+  limitations, and recovery practices.
+- `ros_ws/src/real/README.md` — physical TurtleBot3 workflow and safety scope.
+- `so-arm101/README.md` — standalone vision-sorting workflow.
 
 ## Current Project Status
 
@@ -117,7 +123,7 @@ roboinspec_ws/
 | ------------------------------ | ------------------------------- |
 | Simulation & Inspection System | End-to-end validated            |
 | Physical TurtleBot3            | Field-tested prototype          |
-| Custom UGV / Jetson gate       | Commissioned / archived path    |
+| Custom UGV / Jetson gate       | Commissioned prototype          |
 | SO-ARM Vision Sorting          | End-to-end validated standalone |
 | Full System Integration        | Operator-supervised prototype   |
 
@@ -130,7 +136,7 @@ roboinspec_ws/
   guarded hybrid return workflow
 - Real-robot health checks, hotspot recovery, map/calibration assets, and
   machine-readable run evidence
-- Jetson RealSense safety/load gate and archived custom-UGV commissioning stack
+- Jetson RealSense safety/load gate and namespaced custom-UGV driver
 - SO-ARM autonomous sorting pipeline: detection → classification → taught-grid
   localization → visual servoing → verified grasp → transport & drop
   (stress-tested standalone; see `so-arm101/`)

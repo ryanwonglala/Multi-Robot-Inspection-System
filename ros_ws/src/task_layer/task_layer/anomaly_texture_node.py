@@ -25,6 +25,7 @@ import math
 from pathlib import Path
 
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from rclpy.qos import (QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy,
                        QoSHistoryPolicy)
@@ -56,8 +57,9 @@ class AnomalyTextureNode(Node):
         # of every mission. Mirror that command so Sim-style texture icons do
         # not leak from one randomized stress round into the next.
         self.declare_parameter('control_topic', '/anomaly_markers')
-        self.declare_parameter('image_path',
-                               str(Path.home() / 'roboinspec_ws' / 'markers' / 'anomaly.png'))
+        default_image = (Path(get_package_share_directory('task_layer')) /
+                         'assets' / 'markers' / 'anomaly.png')
+        self.declare_parameter('image_path', str(default_image))
         self.declare_parameter('frame', 'map')
         self.declare_parameter(
             'size', DEFAULT_MARKER_SIZE_M)         # plane edge length (m)
@@ -101,6 +103,10 @@ class AnomalyTextureNode(Node):
         tex = self.image_path.name
         obj = d / '_anomaly_plane.obj'
         mtl = d / '_anomaly_plane.mtl'
+        # Packaged assets already contain the mesh. Reuse it rather than
+        # writing into a potentially read-only install prefix.
+        if obj.is_file() and mtl.is_file():
+            return obj.as_uri()
         # Unit quad in XY centred at origin; double-sided; UVs upright.
         obj.write_text(
             'mtllib _anomaly_plane.mtl\n'

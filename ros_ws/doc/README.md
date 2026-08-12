@@ -1,10 +1,17 @@
 # Doc
 
-Project trace records.
+Final public documentation for the ROS workspace.
+
+## Entry points
+
+- `COMMANDS.md` — common build, launch, navigation, inspection, and baseline
+  commands.
+- `TROUBLESHOOTING.md` — consolidated symptoms, root causes, fixes, known
+  limitations, and recovery practices from the project lifecycle.
 
 ## Layout
 
-Use date folders first:
+Local field records may use date folders:
 
 ```text
 doc/YYYYMMDD/log
@@ -28,4 +35,5 @@ YYYYMMDD_HHMMSS.md
 
 ## Rule
 
-Keep filenames short. Put detail inside the file, not in the path.
+Keep generated logs, rosbags, calibration captures, and site-specific evidence
+local. Consolidate reusable knowledge into the two public entry points above.
