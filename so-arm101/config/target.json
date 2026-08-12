@@ -1,5 +1,5 @@
 {
-  "name": "多目标异常物@固定白纸(参考帧差分)",
+  "name": "红方块@TB3托盘(Lab a 通道红色分割)",
   "hsv_lo": [
     0,
     0,
@@ -10,9 +10,9 @@
     255,
     90
   ],
-  "min_area": 2500,
-  "max_area": 90000,
-  "expected_area": 30000,
+  "min_area": 8000,
+  "max_area": 120000,
+  "expected_area": 40000,
   "area_tolerance": [
     0.55,
     1.7
@@ -20,8 +20,33 @@
   "grip": 8.5,
   "max_elongation": 4.0,
   "posture_max_elong": 1.55,
-  "mode": "refdiff",
+  "mode": "red",
+  "red_a_min": 25.0,
+  "red_l_min": 0.0,
+  "red_l_max": 255.0,
   "classes": {
+    "红方块": {
+      "match": {
+        "a_min": 20
+      },
+      "ref": null,
+      "angle_ref": null,
+      "depth_delta": 1.6,
+      "grip": 8.5,
+      "hold": [
+        15.0,
+        24.0
+      ],
+      "no_roll": true,
+      "lock_pitch": false,
+      "grasp_joints": {
+        "shoulder_pan": 0.44,
+        "shoulder_lift": -11.38,
+        "elbow_flex": 1.76,
+        "wrist_flex": 80.92,
+        "wrist_roll": 3.03
+      }
+    },
     "手串": {
       "match": {
         "solidity_max": 0.7
@@ -100,5 +125,6 @@
         "wrist_roll": 3.32
       }
     }
-  }
+  },
+  "mapping_model": "plane+xc2"
 }

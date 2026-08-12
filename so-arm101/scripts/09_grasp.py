@@ -65,8 +65,15 @@ MAX_RETRY = 3
 
 
 def vertical_wf(cls, sl: float, el: float):
-    """垂直姿态约束: 肩+肘+腕俯仰 ≈ 夹爪绝对俯仰(旧样本实测该和std仅3°)。
-    从该类示教姿态取常数K, 返回当前肩/肘下应设的腕俯仰; 类未示教姿态则返回None。"""
+    """恒定夹爪俯仰约束: 肩+肘+腕俯仰 ≈ 夹爪绝对俯仰(旧样本实测该和std仅3°)。
+    从该类示教姿态取常数K, 返回当前肩/肘下应设的腕俯仰; 返回 None = 不约束。
+
+    lock_pitch=false 的类不约束: 托盘那种抬高的工作面上够不到恒定俯仰(实测每点都得调),
+    此时腕俯仰由映射逐点预测(它本就在 MAP_JOINTS 里)。强行按单一 K 覆盖 = 用俯仰角 B
+    去执行在俯仰角 A 下教的深度, 深度全废。
+    """
+    if cls.get("lock_pitch") is False:
+        return None
     gj = cls.get("grasp_joints")
     if not gj:
         return None

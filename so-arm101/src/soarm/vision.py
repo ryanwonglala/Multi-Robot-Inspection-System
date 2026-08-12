@@ -135,6 +135,58 @@ def _notwhite_mask(frame: np.ndarray, s_min: int = 90, v_max: int = 60) -> np.nd
     return ((hsv[:, :, 1] >= s_min) | (hsv[:, :, 2] <= v_max)).astype(np.uint8) * 255
 
 
+def _red_lab_mask(
+    frame: np.ndarray, a_min: float = 25.0, l_min: float = 0.0, l_max: float = 255.0
+) -> np.ndarray:
+    """Lab a 通道红色分割(白托盘+红方块场景首选)。
+
+    a 已减128居中: 红色 a 显著为正; 白托盘/黑车体/白手指 a≈0; 阴影只压 L 不改 a, 免疫。
+    比 HSV 稳——红色在 HSV 里跨 H=0/179 两端, 单次 inRange 覆盖不全。
+    不依赖参考帧, 托盘随小车停靠微移照样认得出(refdiff 正是死在这一点上)。
+    """
+    lab = cv2.cvtColor(cv2.GaussianBlur(frame, (5, 5), 0), cv2.COLOR_BGR2LAB).astype(np.int16)
+    L = lab[:, :, 0]
+    a = lab[:, :, 1] - 128
+    return (((a >= a_min) & (L >= l_min) & (L <= l_max)).astype(np.uint8)) * 255
+
+
+def _mode_mask(
+    frame: np.ndarray,
+    cfg: dict,
+    roi=None,
+    hsv_lo: tuple | None = None,
+    hsv_hi: tuple | None = None,
+) -> np.ndarray:
+    """按 config/target.json 的 mode 选分割器。detect_blobs 与 classify_blob 共用。
+
+    共用是必须的: classify_blob 此前写死 _ref_diff_mask, 一换检测模式分类就拿错掩码,
+    solidity 和 Lab 中值全部失真。调用方显式给 hsv_lo 时一律走 HSV(显式优先于 config)。
+    """
+    mode = cfg.get("mode")
+    if hsv_lo is None and mode == "red":
+        return _red_lab_mask(
+            frame,
+            a_min=cfg.get("red_a_min", 25.0),
+            l_min=cfg.get("red_l_min", 0.0),
+            l_max=cfg.get("red_l_max", 255.0),
+        )
+    if hsv_lo is None and mode == "refdiff":
+        return _ref_diff_mask(
+            frame,
+            l_thresh=cfg.get("ref_l_thresh", 45.0),
+            chroma_thresh=cfg.get("ref_chroma_thresh", 12.0),
+        )
+    if hsv_lo is None and mode == "surface":
+        return _surface_anomaly_mask(
+            frame, roi,
+            chroma_thresh=cfg.get("chroma_thresh", 14.0),
+            edge_density_thresh=cfg.get("edge_density_thresh", 0.07),
+        )
+    lo = hsv_lo if hsv_lo is not None else tuple(cfg.get("hsv_lo", YELLOW_LO))
+    hi = hsv_hi if hsv_hi is not None else tuple(cfg.get("hsv_hi", YELLOW_HI))
+    return cv2.inRange(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV), np.array(lo), np.array(hi))
+
+
 def classify_blob(frame: np.ndarray, blob: Blob) -> str | None:
     """按 config classes 的 match 规则给观察位目标分类; None = 未定义类(不抓)。
 
@@ -143,11 +195,12 @@ def classify_blob(frame: np.ndarray, blob: Blob) -> str | None:
       L/a/b    = 掩码内像素的 Lab 中值(a<0 偏绿, a>0 偏红, b>0 偏黄; 已减128居中)
     规则键: solidity_max, l_max, a_max, a_min, b_max, abs_a_max。按配置顺序首中即得。
     """
-    classes = _target_cfg().get("classes")
+    cfg = _target_cfg()
+    classes = cfg.get("classes")
     if not classes:
         return None
     x, y, w, h = blob.bbox
-    m = _ref_diff_mask(frame)[y : y + h, x : x + w] > 0
+    m = _mode_mask(frame, cfg)[y : y + h, x : x + w] > 0
     if m.sum() < 50:
         return None
     solidity = float(m.sum()) / max(blob.area, 1.0)
@@ -183,7 +236,8 @@ def detect_blobs(
     """返回按面积降序的目标列表。
 
     分割模式: seg 显式指定优先; 否则由 config/target.json 的 mode 决定:
-      "refdiff" = 参考帧差分(观察位固定+净空参考照, 首选)
+      "red"     = Lab a 通道红色分割(白托盘+红方块, 不依赖参考帧, 抗托盘平移)
+      "refdiff" = 参考帧差分(观察位固定+净空参考照)
       "surface" = 表面色异常分割(无参考照时的兜底)
       其他/缺省 = HSV 阈值分割(参数未显式给出时取 config, 兜底黄色)
     """
@@ -192,23 +246,8 @@ def detect_blobs(
     max_area = max_area if max_area is not None else cfg.get("max_area", 30000)
     if seg == "notwhite":
         mask = _notwhite_mask(frame)
-    elif cfg.get("mode") == "refdiff" and hsv_lo is None:
-        mask = _ref_diff_mask(
-            frame,
-            l_thresh=cfg.get("ref_l_thresh", 45.0),
-            chroma_thresh=cfg.get("ref_chroma_thresh", 12.0),
-        )
-    elif cfg.get("mode") == "surface" and hsv_lo is None:
-        mask = _surface_anomaly_mask(
-            frame, roi,
-            chroma_thresh=cfg.get("chroma_thresh", 14.0),
-            edge_density_thresh=cfg.get("edge_density_thresh", 0.07),
-        )
     else:
-        hsv_lo = hsv_lo if hsv_lo is not None else tuple(cfg.get("hsv_lo", YELLOW_LO))
-        hsv_hi = hsv_hi if hsv_hi is not None else tuple(cfg.get("hsv_hi", YELLOW_HI))
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, np.array(hsv_lo), np.array(hsv_hi))
+        mask = _mode_mask(frame, cfg, roi, hsv_lo, hsv_hi)
     if roi is not None:
         x, y, w, h = roi
         m = np.zeros_like(mask)
