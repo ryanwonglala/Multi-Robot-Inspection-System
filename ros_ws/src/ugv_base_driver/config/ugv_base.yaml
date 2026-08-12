@@ -1,0 +1,15 @@
+ugv_base_node:
+  ros__parameters:
+    port: /dev/ttyTHS1
+    baud: 115200
+    max_linear: 0.15
+    max_angular: 0.80
+    deadman_timeout: 0.40
+    command_rate: 20.0
+    feedback_timeout: 2.0
+    meters_per_tick: 0.01
+    track_width: 0.41
+    max_tick_jump: 100
+    odom_frame: ugv/odom
+    base_frame: ugv/base_link
+    publish_tf: true

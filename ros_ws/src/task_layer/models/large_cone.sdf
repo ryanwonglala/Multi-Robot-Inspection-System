@@ -5,12 +5,12 @@
     <link name="body">
       <collision name="collision">
         <geometry>
-          <mesh><uri>model://primitives/cone.stl</uri><scale>0.2000 0.2000 0.2000</scale></mesh>
+          <mesh><uri>model://primitives/cone.stl</uri><scale>0.2800 0.2800 0.2800</scale></mesh>
         </geometry>
       </collision>
       <visual name="visual">
         <geometry>
-          <mesh><uri>model://primitives/cone.stl</uri><scale>0.2000 0.2000 0.2000</scale></mesh>
+          <mesh><uri>model://primitives/cone.stl</uri><scale>0.2800 0.2800 0.2800</scale></mesh>
         </geometry>
         <material>
           <diffuse>0.050 0.500 0.150 1</diffuse>

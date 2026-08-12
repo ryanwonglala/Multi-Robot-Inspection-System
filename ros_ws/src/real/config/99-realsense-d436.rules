@@ -1,0 +1,13 @@
+# RealSense D436 (USB 8086:1156) motion HID access.
+#
+# RGB/depth use UVC video nodes, while the embedded accel/gyro use hidraw.
+# Jetson L4T created the HID node as root:root 0600, so librealsense could
+# stream video but reported "No HID info provided, IMU is disabled".
+#
+# Scope this rule to the D436 PID only. The nvidia runtime user is already a
+# member of plugdev; TAG+="uaccess" also supports an active local seat.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="1156", GROUP:="plugdev", MODE:="0660", TAG+="uaccess"
+
+# The RSUSB fallback used on Jetson kernels without CONFIG_HID_SENSOR_HUB
+# needs read/write access to the complete USB device as well.
+SUBSYSTEM=="usb", ATTR{idVendor}=="8086", ATTR{idProduct}=="1156", GROUP:="plugdev", MODE:="0660", TAG+="uaccess"

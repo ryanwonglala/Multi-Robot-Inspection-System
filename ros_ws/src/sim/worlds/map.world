@@ -2,8 +2,11 @@
   <world name='map'>
     <physics type='ode'>
       <max_step_size>0.001</max_step_size>
-      <real_time_factor>1</real_time_factor>
-      <real_time_update_rate>1000</real_time_update_rate>
+      <!-- live-demo (feat/live-demo-tweaks): 2x sim speed. RTF = step*rate =
+           0.001*2000 = 2.0. Revert rate to 1000 after the demo. CPU-bound:
+           check the Gazebo "Real Time Factor" readout actually reaches ~2. -->
+      <real_time_factor>2</real_time_factor>
+      <real_time_update_rate>2000</real_time_update_rate>
     </physics>
     <scene>
       <ambient>0.62 0.62 0.6 1</ambient>

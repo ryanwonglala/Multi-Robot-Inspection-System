@@ -33,6 +33,7 @@ class SetInitialPoseNode(Node):
         self._pub = self.create_publisher(
             PoseWithCovarianceStamped, 'initialpose', 10)
         self._sent = 0
+        self._finished = False
         self._repeat_count = int(self.get_parameter('repeat_count').value)
 
         delay = float(self.get_parameter('delay_sec').value)
@@ -51,9 +52,7 @@ class SetInitialPoseNode(Node):
 
     def _publish_once(self):
         if self._sent >= self._repeat_count:
-            self._timer.cancel()
-            self.get_logger().info('Initial pose publishing complete — node exiting')
-            rclpy.shutdown()
+            self._finish()
             return
 
         msg = PoseWithCovarianceStamped()
@@ -81,14 +80,28 @@ class SetInitialPoseNode(Node):
             f'y={msg.pose.pose.position.y:.3f} '
             f'yaw={math.degrees(yaw):.1f}°'
         )
+        if self._sent >= self._repeat_count:
+            self._finish()
+
+    @property
+    def finished(self):
+        return self._finished
+
+    def _finish(self):
+        if self._finished:
+            return
+        self._timer.cancel()
+        self._finished = True
+        self.get_logger().info('Initial pose publishing complete — node exiting')
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = SetInitialPoseNode()
     try:
-        rclpy.spin(node)
-    except SystemExit:
+        while rclpy.ok() and not node.finished:
+            rclpy.spin_once(node)
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         node.destroy_node()

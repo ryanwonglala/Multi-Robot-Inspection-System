@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="202mm" height="154mm" viewBox="0 0 202 154">
+  <!--
+    8 x 6 squares => 7 x 5 INNER corners.
+    Each square is exactly 24 mm when printed at 100% / Actual Size.
+    After printing, verify that four adjacent squares measure 96 mm.
+  -->
+  <rect width="202" height="154" fill="white"/>
+  <defs>
+    <pattern id="checker" width="48" height="48"
+             patternUnits="userSpaceOnUse">
+      <rect x="0" y="0" width="24" height="24" fill="black"/>
+      <rect x="24" y="24" width="24" height="24" fill="black"/>
+    </pattern>
+  </defs>
+  <rect x="5" y="5" width="192" height="144" fill="url(#checker)"/>
+</svg>

@@ -1,0 +1,470 @@
+# Real-robot Nav2 params — derived from task_layer/config/nav2_inspection.yaml.
+# Changes vs sim: use_sim_time false everywhere; MPPI velocity/accel limits
+# reduced for the physical burger (vx 0.15, wz 1.0, ax 0.8); inflation 0.15
+# (0.30 seals narrow gaps); viewpoint arrival is position-only at 0.05 m;
+# costmap scan topic fixed to /scan (single robot, no namespace).
+# Nav2 parameter file for RoboInspect — TB3 Burger + Gazebo Classic 11 + ROS2 Humble
+#
+# Changes from TB4/Jazzy reference:
+#   - Added amcl and map_server sections
+#   - use_sim_time: false in every node
+#   - enable_stamped_cmd_vel: false  (Humble nav2 emits Twist; burger diff_drive subscribes Twist)
+#   - map yaml_filename injected via launch 'map' arg (default: package maps/tb3_map.yaml)
+#   - All topics relative so nav2_bringup namespace remapping works (multi-robot)
+#   - MPPI controller settings left unchanged
+
+amcl:
+  ros__parameters:
+    use_sim_time: false
+    alpha1: 0.2
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+    base_frame_id: "base_footprint"
+    beam_skip_distance: 0.5
+    beam_skip_error_threshold: 0.9
+    beam_skip_threshold: 0.3
+    do_beamskip: false
+    global_frame_id: "map"
+    lambda_short: 0.1
+    laser_likelihood_max_dist: 2.0
+    laser_max_range: 100.0
+    laser_min_range: -1.0
+    laser_model_type: "likelihood_field"
+    max_beams: 60
+    max_particles: 2000
+    min_particles: 500
+    odom_frame_id: "odom"
+    pf_err: 0.05
+    pf_z: 0.99
+    recovery_alpha_fast: 0.0
+    recovery_alpha_slow: 0.0
+    resample_interval: 1
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    save_pose_rate: 0.5
+    sigma_hit: 0.2
+    tf_broadcast: true
+    transform_tolerance: 1.0
+    # The arena's shortest leg (home -> vp1) is only ~0.36 m.  The previous
+    # 0.25 m / 0.20 rad thresholds produced just 14 AMCL updates while odom
+    # produced 723 samples, so the stateful goal checker could latch XY using
+    # odometry and report success before a late scan correction moved the
+    # settled map pose back outside tolerance.  Update at 5 cm / ~3 deg so
+    # short viewpoint approaches remain anchored to the map.
+    update_min_a: 0.05
+    update_min_d: 0.05
+    z_hit: 0.5
+    z_max: 0.05
+    z_rand: 0.5
+    z_short: 0.05
+    scan_topic: scan
+    map_topic: map
+    always_reset_initial_pose: false
+    # The physical inspection procedure always starts with the robot aligned
+    # on the taped v5 HOME pose. Initialise during AMCL configure so Nav2
+    # bringup cannot deadlock waiting for a runtime /initialpose message.
+    set_initial_pose: true
+    initial_pose:
+      x: -0.003
+      y: 0.017
+      z: 0.0
+      yaw: -0.054
+
+map_server:
+  ros__parameters:
+    use_sim_time: false
+    # yaml_filename is injected at runtime by the launch 'map' argument
+    # (nav2_bringup RewrittenYaml). Empty placeholder fails loudly if this
+    # file is used without going through the launch.
+    yaml_filename: ""
+
+map_saver:
+  ros__parameters:
+    use_sim_time: false
+    save_map_timeout: 5.0
+    free_thresh_default: 0.25
+    occupied_thresh_default: 0.65
+    map_subscribe_transient_local: true
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    enable_stamped_cmd_vel: false
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    wait_for_service_timeout: 1000
+    action_server_result_timeout: 900.0
+    navigators: ["navigate_to_pose", "navigate_through_poses"]
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator/NavigateToPoseNavigator"
+    navigate_through_poses:
+      plugin: "nav2_bt_navigator/NavigateThroughPosesNavigator"
+    error_code_names:
+      - compute_path_error_code
+      - follow_path_error_code
+
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    enable_stamped_cmd_vel: false
+    # RotationShim queries this optional controller-server flag on Humble.
+    # Declare it explicitly to keep activation logs free of a false warning.
+    verbose: false
+    controller_frequency: 20.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["viewpoint_position_checker"]
+    controller_plugins: ["FollowPath"]
+    use_realtime_priority: false
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      # Keep the 5 cm arrival contract below, while allowing the Burger's
+      # centimetre-scale final crawl. A 10 cm progress radius is internally
+      # inconsistent with a 5 cm goal: at 8--9 cm error the robot only needs
+      # another 3--4 cm, so recovery declares "no progress" too early.
+      required_movement_radius: 0.02
+      movement_time_allowance: 15.0
+    viewpoint_position_checker:
+      # Patrol arrival is deliberately independent of yaw.  The inspection
+      # task performs its own stationary scan rotation after XY is verified.
+      stateful: false
+      plugin: "nav2_controller::PositionGoalChecker"
+      xy_goal_tolerance: 0.05
+    FollowPath:
+      # vp1 is only ~0.35 m from the map origin but roughly 60 deg off the
+      # robot's initial heading.  Bare MPPI tried to advance along +x instead
+      # of first acquiring that short lateral path and repeatedly tripped the
+      # progress checker.  Keep MPPI for path tracking, but use Nav2's rotation
+      # shim to acquire large initial path headings (and the authored final
+      # path heading explicitly.  Final camera orientation is handled later
+      # by the stationary scan stage, not by point-to-point navigation.
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      primary_controller: "nav2_mppi_controller::MPPIController"
+      angular_dist_threshold: 0.35
+      angular_disengage_threshold: 0.15
+      forward_sampling_distance: 0.15
+      rotate_to_heading_angular_vel: 0.50
+      max_angular_accel: 1.00
+      simulate_ahead_time: 1.0
+      rotate_to_goal_heading: false
+      closed_loop: true
+      time_steps: 56
+      model_dt: 0.05
+      batch_size: 2000
+      ax_max: 0.8
+      ax_min: -0.8
+      ay_max: 0.0
+      az_max: 1.5
+      vx_std: 0.2
+      vy_std: 0.2
+      wz_std: 0.4
+      vx_max: 0.15
+      vx_min: -0.1
+      vy_max: 0.0
+      wz_max: 1.0
+      iteration_count: 1
+      prune_distance: 1.7
+      transform_tolerance: 0.1
+      temperature: 0.3
+      gamma: 0.015
+      motion_model: "DiffDrive"
+      # RViz does not consume MPPI's sampled-trajectory debug cloud in this
+      # experiment. Publishing it contributed to frequent 20 Hz controller
+      # loop overruns during the intermittent VP2 -> VP3 stall.
+      visualize: false
+      regenerate_noises: true
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      AckermannConstraints:
+        min_turning_r: 0.2
+      critics: [
+        "ConstraintCritic", "CostCritic", "GoalCritic",
+        "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
+        "PathAngleCritic", "PreferForwardCritic"]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4
+      GoalAngleCritic:
+        # Arrival yaw is not part of viewpoint navigation acceptance.
+        enabled: false
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.15
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.81
+        critical_cost: 300.0
+        consider_footprint: true
+        collision_cost: 1000000.0
+        near_goal_distance: 1.0
+        trajectory_point_step: 2
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 0
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      enable_stamped_cmd_vel: false
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.06
+      footprint: "[[ 0.105,  0.000],
+                  [ 0.074, -0.074],
+                  [ 0.000, -0.105],
+                  [-0.074, -0.074],
+                  [-0.105,  0.000],
+                  [-0.074,  0.074],
+                  [ 0.000,  0.105],
+                  [ 0.074,  0.074]]"
+      plugins: ["static_layer", "voxel_layer", "inflation_layer"]
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # Arena passages are only 0.6 m wide (corridor) / 0.65 m (room door);
+        # 0.30 inflation from both sides seals them shut. Burger radius is 0.105,
+        # so 0.15 + steep falloff keeps a navigable band while hugging center.
+        cost_scaling_factor: 5.0
+        inflation_radius: 0.15
+      voxel_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        enabled: true
+        publish_voxel_map: true
+        origin_z: 0.0
+        z_resolution: 0.05
+        z_voxels: 16
+        max_obstacle_height: 2.0
+        mark_threshold: 0
+        observation_sources: scan
+        scan:
+          # MUST be the robot's absolute scan topic. A relative 'scan'
+          # resolves inside the costmap node's own sub-namespace
+          # (/<ns>/global_costmap/scan) — a dead letter box: both costmaps
+          # were scan-deaf since namespace-ization and obstacles never
+          # entered them. <robot_namespace> is substituted by
+          # nav2_bringup's ReplaceString when use_namespace is true.
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+      always_send_full_costmap: true
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      enable_stamped_cmd_vel: false
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      footprint: "[[ 0.105,  0.000],
+                  [ 0.074, -0.074],
+                  [ 0.000, -0.105],
+                  [-0.074, -0.074],
+                  [-0.105,  0.000],
+                  [-0.074,  0.074],
+                  [ 0.000,  0.105],
+                  [ 0.074,  0.074]]"
+      resolution: 0.06
+      track_unknown_space: true
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          # MUST be the robot's absolute scan topic. A relative 'scan'
+          # resolves inside the costmap node's own sub-namespace
+          # (/<ns>/global_costmap/scan) — a dead letter box: both costmaps
+          # were scan-deaf since namespace-ization and obstacles never
+          # entered them. <robot_namespace> is substituted by
+          # nav2_bringup's ReplaceString when use_namespace is true.
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # Arena passages are only 0.6 m wide (corridor) / 0.65 m (room door);
+        # 0.30 inflation from both sides seals them shut. Burger radius is 0.105,
+        # so 0.15 + steep falloff keeps a navigable band while hugging center.
+        cost_scaling_factor: 5.0
+        inflation_radius: 0.15
+      always_send_full_costmap: true
+
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    enable_stamped_cmd_vel: false
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.5
+      use_astar: false
+      allow_unknown: true
+
+smoother_server:
+  ros__parameters:
+    use_sim_time: false
+    enable_stamped_cmd_vel: false
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: true
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: false
+    enable_stamped_cmd_vel: false
+    # This Nav2 release exposes one costmap/footprint pair for behaviors.
+    # Spin uses the rolling local costmap, whose frame is odom, so its pose
+    # lookup must use odom too. Using map here makes collision checking index
+    # the odom costmap with map coordinates and can report false collisions.
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 20.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors/DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+    assisted_teleop:
+      plugin: "nav2_behaviors/AssistedTeleop"
+    global_frame: odom
+    robot_base_frame: base_link
+    transform_tolerance: 0.1
+    simulate_ahead_time: 2.0
+    # Inspection scans favor angular repeatability over recovery speed.
+    # The previous 0.4 rad/s floor overshot 60-degree stops by roughly
+    # 8--11 degrees on the physical Burger.
+    max_rotational_vel: 0.5
+    min_rotational_vel: 0.1
+    rotational_acc_lim: 1.0
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: false
+    enable_stamped_cmd_vel: false
+    loop_rate: 20
+    stop_on_failure: false
+    action_server_result_timeout: 900.0
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: true
+      waypoint_pause_duration: 200
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: false
+    enable_stamped_cmd_vel: false
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.22, 0.0, 2.84]
+    min_velocity: [-0.22, 0.0, -2.84]
+    max_accel: [2.5, 0.0, 3.2]
+    max_decel: [-2.5, 0.0, -3.2]
+    odom_topic: "odom"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+
+collision_monitor:
+  ros__parameters:
+    use_sim_time: false
+    enable_stamped_cmd_vel: false
+    base_frame_id: "base_link"
+    odom_frame_id: "odom"
+    cmd_vel_in_topic: "cmd_vel_smoothed"
+    cmd_vel_out_topic: "cmd_vel"
+    state_topic: "collision_monitor_state"
+    transform_tolerance: 0.2
+    source_timeout: 1.0
+    base_shift_correction: true
+    stop_pub_timeout: 2.0
+    polygons: ["FootprintApproach"]
+    FootprintApproach:
+      type: "polygon"
+      action_type: "approach"
+      footprint_topic: "local_costmap/published_footprint"
+      time_before_collision: 1.2
+      simulation_time_step: 0.1
+      min_points: 6
+      visualize: false
+      enabled: true
+    observation_sources: ["scan"]
+    scan:
+      type: "scan"
+      topic: "scan"
+      min_height: 0.15
+      max_height: 2.0
+      enabled: true

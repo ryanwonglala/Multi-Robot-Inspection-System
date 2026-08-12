@@ -1,15 +1,18 @@
 # RoboInspect — Multi-Robot Indoor Inspection System
 
-A **simulation-first** multi-robot system for autonomous indoor inspection,
-built on ROS 2 Humble. The system tasks a fleet of robots to patrol an indoor
+A simulation-to-real multi-robot system for autonomous indoor inspection,
+built around ROS 2 Humble. The system tasks robots to patrol an indoor
 environment, detect environmental changes from camera imagery, localize the
-anomalies on the map, and produce an inspection report — with a future path
-toward physical robotic response using a custom mobile robot and an SO-ARM
-manipulator.
+anomalies on the map, and produce inspection reports. The repository also
+contains the physical TurtleBot3 workflow, a Jetson/RealSense safety gate, an
+archived custom UGV stack, and the standalone SO-ARM response station.
 
-> **Status:** Mid-Term milestone. The simulation inspection workflow is
-> validated end-to-end; the two hardware platforms are under active
-> development and not yet integrated.
+> **Status (final project snapshot, August 2026):** the simulation inspection
+> workflow and standalone SO-ARM sorting pipeline are validated end-to-end.
+> The physical TurtleBot3 stack has completed field trials for localization,
+> Nav2 transit, AprilTag terminal alignment, inspection, and return/docking.
+> Cross-platform handoff remains an operator-supervised integration rather
+> than a fully autonomous production deployment.
 
 ## Objective
 
@@ -45,16 +48,28 @@ Implemented in this repository under `ros_ws/`. Current capabilities:
   setup and live monitoring, a fleet-wide anomaly bus, and generated YAML +
   bilingual (中文/English) Markdown reports with collected evidence.
 
-*Remaining work:* anomaly response logic, dashboard refinement, sim-to-real
-deployment.
+The final demo layer also includes audio state cues and textured RViz anomaly
+markers. Generated baselines and reports stay local because they are tied to a
+particular camera, map, and inspection site.
 
-### 2 · Custom Mobile Robot Platform  — *hardware integration in progress*
+### 2 · Physical Robot Deployment  — *field-tested prototype*
 
-*Completed:* chassis assembled · Jetson Nano installed · LiDAR installed ·
-depth camera installed · ROS 2 Humble configured · preliminary sensor testing.
+Implemented under `ros_ws/src/real/`, `ros_ws/src/ugv_base_driver/`, and
+`jetson_realsense_gate/`:
 
-*In progress:* ROS 2 communication · SLAM · localization · autonomous
-navigation · integration with the inspection workflow.
+- TurtleBot3 mapping/localization, camera calibration, Nav2 navigation, health
+  checks, inspection workflow, AprilTag visual servoing, and hybrid return.
+- Hotspot/Fast DDS recovery helpers for repeatable field setup.
+- Namespaced custom-UGV base driver and a Jetson RealSense safety/load gate.
+- Machine-readable run reports and guarded motion limits for physical trials.
+
+The final field evidence includes repeated runs that passed all automatic
+navigation and AprilTag gates. One low-battery trial stopped during the final
+reverse step (`odom_stop`), so docking still requires an operator check and a
+healthy-battery preflight. Site maps, camera images, device calibration, and
+network runbooks are intentionally kept outside this public repository. The
+earlier Wave Rover experiments are preserved in `ugv02_archive/` and are not
+the primary production path.
 
 ### 3 · SO-ARM Vision Sorting Module  — *autonomous sorting pipeline validated (standalone)*
 
@@ -72,8 +87,9 @@ verification · transport & drop choreography · stress-test tooling with
 logged success-rate data · full worklogs and a new-site deployment guide
 (`so-arm101/docs/`).
 
-*Remaining:* uniform printed-cube targets (colors = classes) · tray-scenario
-detection switch · TB3 docking handoff · on-site deployment.
+The module remains intentionally independent of ROS. The TurtleBot3-to-arm
+handoff and unattended multi-platform operation are documented extension
+points, not claims of the final prototype.
 
 ## Repository Structure
 
@@ -83,43 +99,50 @@ roboinspec_ws/
 │   └── src/
 │       ├── task_layer/  # Task allocation, inspection runner, change detection,
 │       │                #   anomaly localization, reporting, operator GUI
-│       └── sim/         # Gazebo worlds + TurtleBot3 robot models, launch files
+│       ├── sim/         # Gazebo worlds + TurtleBot3 models and launch files
+│       ├── real/        # Physical TB3 bringup, navigation and field workflows
+│       └── ugv_base_driver/ # Namespaced custom-UGV commissioning driver
+├── jetson_realsense_gate/ # Jetson RGB-D safety and load-detection gate
 ├── so-arm101/           # SO-ARM101 vision sorting subsystem (Python + lerobot,
 │                        #   no ROS; see so-arm101/README.md)
-├── archive/             # Previous archived development versions
-├── doc/                 # Project trace records / development logs
-└── reports/             # Generated inspection reports
+├── ugv02_archive/       # Preserved Wave Rover commissioning implementation
+├── archive/             # Earlier project versions
+├── markers/             # RViz anomaly-marker runtime assets
+└── sounds/              # Optional final-demo audio cues
 ```
 
 ## Current Project Status
 
 | Workstream                     | Status                          |
 | ------------------------------ | ------------------------------- |
-| Simulation & Inspection System | Core workflow validated         |
-| Custom Mobile Robot            | Hardware integration in progress|
-| SO-ARM Vision Sorting          | Pipeline validated (standalone) |
-| Full System Integration        | Planned                         |
+| Simulation & Inspection System | End-to-end validated            |
+| Physical TurtleBot3            | Field-tested prototype          |
+| Custom UGV / Jetson gate       | Commissioned / archived path    |
+| SO-ARM Vision Sorting          | End-to-end validated standalone |
+| Full System Integration        | Operator-supervised prototype   |
 
 ## Roadmap
 
 **Completed**
 - End-to-end inspection workflow in simulation (allocate → navigate → capture →
   detect → localize → report)
-- Mobile robot hardware assembly and preliminary sensor testing
+- Physical TB3 localization, Nav2 transit, inspection, AprilTag alignment, and
+  guarded hybrid return workflow
+- Real-robot health checks, hotspot recovery, map/calibration assets, and
+  machine-readable run evidence
+- Jetson RealSense safety/load gate and archived custom-UGV commissioning stack
 - SO-ARM autonomous sorting pipeline: detection → classification → taught-grid
   localization → visual servoing → verified grasp → transport & drop
   (stress-tested standalone; see `so-arm101/`)
 
-**In Progress**
-- Mobile robot ROS 2 communication, SLAM, localization, autonomous navigation
-- SO-ARM: uniform printed-cube targets and tray-scenario detection
-- Dashboard refinement and anomaly response logic
-
-**Future Work**
-- Sim-to-real deployment of the inspection workflow
-- TB3 tray docking + SO-ARM handoff (physical anomaly response)
-- Full multi-robot system integration (inspection + physical response)
+**Known limitations / extension points**
+- Final physical docking requires operator validation; low battery can trigger
+  the guarded odometry-stop abort.
+- Camera baselines must be recorded again when the device, map, pose, or site
+  changes; they are deliberately excluded from version control.
+- TB3 tray docking to SO-ARM and unattended multi-platform orchestration remain
+  future integration work.
 
 ---
 
-*Simulation built on ROS 2 Humble · Nav2 · Gazebo · RViz. Mid-term milestone — not a final release.*
+*Final academic-project snapshot · ROS 2 Humble · Nav2 · Gazebo · RViz · AprilTag · RealSense.*

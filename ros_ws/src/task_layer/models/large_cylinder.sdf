@@ -6,12 +6,12 @@
       <pose>0 0 0.1000 0 0 0</pose>
       <collision name="collision">
         <geometry>
-          <cylinder><radius>0.1000</radius><length>0.2000</length></cylinder>
+          <cylinder><radius>0.1400</radius><length>0.2800</length></cylinder>
         </geometry>
       </collision>
       <visual name="visual">
         <geometry>
-          <cylinder><radius>0.1000</radius><length>0.2000</length></cylinder>
+          <cylinder><radius>0.1400</radius><length>0.2800</length></cylinder>
         </geometry>
         <material>
           <diffuse>0.080 0.250 0.700 1</diffuse>

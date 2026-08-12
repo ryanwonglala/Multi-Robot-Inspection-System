@@ -11,13 +11,15 @@ import time
 import rclpy
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
+from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import DriveOnHeading, NavigateToPose, Spin
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
-from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import CameraInfo, Image, LaserScan
+from rclpy.qos import (QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy,
+                       qos_profile_sensor_data)
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, LaserScan
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 import yaml
@@ -26,6 +28,7 @@ from task_layer.area_clear_check import AreaClearChecker
 from task_layer.photo_diff_check import (
     CameraModel,
     detect_changes,
+    detect_red_targets,
     merge_photo_detections,
 )
 from task_layer.report_writer import (
@@ -63,12 +66,122 @@ def yaw_to_quaternion(yaw: float) -> dict:
     }
 
 
+def shortest_angular_distance(current: float, target: float) -> float:
+    """Signed shortest rotation from current yaw to target yaw."""
+    return math.atan2(math.sin(target - current), math.cos(target - current))
+
+
+def calibrated_spin_command(
+    current: float,
+    target: float,
+    command_scale: float,
+) -> float:
+    """Relative Nav2 Spin command for an absolute map-frame target yaw."""
+    return shortest_angular_distance(current, target) * command_scale
+
+
+def direct_heading_and_distance(current_pose: tuple[float, float, float],
+                                goal_x: float,
+                                goal_y: float) -> tuple[float, float]:
+    """Map heading and Euclidean distance for a collision-checked straight leg."""
+    dx = float(goal_x) - float(current_pose[0])
+    dy = float(goal_y) - float(current_pose[1])
+    return math.atan2(dy, dx), math.hypot(dx, dy)
+
+
+def recoverable_viewpoint_near_miss(
+    result: dict,
+    continuity_tolerance_m: float,
+) -> bool:
+    """Whether a safely stopped segmented arrival may continue its scan.
+
+    This deliberately excludes generic Nav2 aborts/timeouts and any action
+    whose terminal state was not confirmed.  It only absorbs centimetre-scale
+    AMCL boundary jitter after the bounded segmented correction sequence.
+    """
+    if (result.get('status') != 'segmented_xy_miss'
+            or not result.get('safe_to_continue', False)):
+        return False
+    try:
+        error = float(result['xy_error_m'])
+        strict_tolerance = float(result['xy_tolerance_m'])
+        continuity_tolerance = float(continuity_tolerance_m)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (math.isfinite(error) and math.isfinite(strict_tolerance)
+            and strict_tolerance < error <= continuity_tolerance)
+
+
 def normalize_text(value: str) -> str:
     return value.strip().lower().replace(' ', '_').replace('-', '_')
 
 
 def safe_path_name(value: str) -> str:
     return ''.join(char if char.isalnum() or char in {'_', '-'} else '_' for char in value)
+
+
+def inside_clearance_radius(
+    goal_x: float,
+    goal_y: float,
+    cell_x: float,
+    cell_y: float,
+    radius: float,
+) -> bool:
+    """Whether a costmap cell center lies in the configured circular guard."""
+    return math.hypot(cell_x - goal_x, cell_y - goal_y) <= radius
+
+
+def inspection_sector(area: dict, stop_label: str,
+                      yaw_index: int) -> dict | None:
+    """Return the site-verified semantic sector for one captured view."""
+    sectors = area.get('inspection_sectors') or {}
+    for sector in sectors.get(stop_label, []):
+        if int(sector.get('yaw_index', -1)) == int(yaw_index):
+            return sector
+    return None
+
+
+def authored_scan_yaw_indices(area: dict, yaw_count: int) -> list[int]:
+    """Return stable authored indices for a full or subset scan.
+
+    A one-heading field check may set ``scan_yaws: [2.0944]`` while that
+    heading is still the site's canonical yaw02.  Without the parallel
+    ``scan_yaw_indices: [2]`` metadata, baseline files and sector lookup would
+    silently call it yaw00 merely because it is first in the temporary list.
+    """
+    configured = area.get('scan_yaw_indices')
+    if configured is None:
+        return list(range(yaw_count))
+    indices = [int(value) for value in configured]
+    if len(indices) != yaw_count:
+        raise ValueError(
+            'scan_yaw_indices must contain exactly one index per scan_yaw')
+    if len(set(indices)) != len(indices) or any(index < 0 for index in indices):
+        raise ValueError('scan_yaw_indices must be unique non-negative integers')
+    return indices
+
+
+def classify_sector_zone(sector: dict | None,
+                         detection_range_m: float | None) -> str | None:
+    """Classify a detection into the observed VP/handling zone.
+
+    Pure sectors have one zone. Mixed sectors use the authored near/far rule
+    and its coarse range split; exact map localization is deliberately not a
+    requirement for the small-object patrol report.
+    """
+    if not sector:
+        return None
+    zones = [str(zone) for zone in sector.get('observed_zones', [])]
+    if len(zones) == 1:
+        return zones[0]
+    rule = str(sector.get('zone_rule', ''))
+    split = sector.get('zone_split_range_m')
+    if rule.startswith('near_') and '_far_' in rule and split is not None:
+        near_zone, far_zone = rule[len('near_'):].split('_far_', 1)
+        if detection_range_m is not None:
+            return (near_zone if float(detection_range_m) <= float(split)
+                    else far_zone)
+    return '_or_'.join(zones) if zones else None
 
 
 class InspectionRunner(Node):
@@ -93,10 +206,73 @@ class InspectionRunner(Node):
         self.declare_parameter('scan_yaws', [0.0, 1.0472, 2.0944, 3.1416,
                                              -2.0944, -1.0472])
         self.declare_parameter('scan_settle_sec', 1.0)
+        # A PositionGoalChecker deliberately ignores viewpoint orientation so
+        # patrol arrival is judged by XY only. On the real robot, therefore,
+        # same-XY NavigateToPose goals cannot perform the camera sweep. Use the
+        # behavior_server Spin action for each absolute map yaw instead. The
+        # scale compensates the measured Burger response: a 1.000 rad command
+        # produces about 1.047 rad of physical rotation.
+        self.declare_parameter('scan_use_spin_action', False)
+        self.declare_parameter('scan_spin_action_name', 'spin')
+        self.declare_parameter('scan_spin_timeout_sec', 20.0)
+        self.declare_parameter('scan_spin_command_scale', 1.0 / 1.0472)
+        self.declare_parameter('scan_spin_step_rad', 1.0)
+        self.declare_parameter('scan_spin_skip_tolerance_rad', 0.03)
+        # A transient TF/footprint miss can make Nav2 terminate a Spin in less
+        # than a second even though the action is safely stopped. Retry only a
+        # confirmed-terminal result; an unconfirmed goal still latches the
+        # mission-wide safety abort and is never followed by another command.
+        self.declare_parameter('scan_spin_max_attempts', 1)
+        # A workflow may hand the final viewpoint directly to another motion
+        # stage.  Restore the first scan heading after the final viewpoint so
+        # the handoff starts from a repeatable orientation instead of yaw05.
+        self.declare_parameter('restore_final_viewpoint_scan_yaw', False)
+        self.declare_parameter('restore_final_viewpoint_scan_yaw_attempts', 1)
+        # Real-arena Home -> VP1 is a 0.38 m diagonal that MPPI repeatedly
+        # over-corrects. Use Nav2's collision-checked straight behavior for an
+        # orthogonal line-turn-line entry, then verify final AMCL XY.
+        self.declare_parameter('home_to_vp1_segmented', False)
+        self.declare_parameter('segmented_entry_drive_action', '/drive_on_heading')
+        self.declare_parameter('segmented_entry_speed_mps', 0.05)
+        self.declare_parameter('segmented_entry_timeout_sec', 15.0)
+        self.declare_parameter('segmented_entry_home_radius_m', 0.15)
+        self.declare_parameter('segmented_entry_xy_tolerance_m', 0.05)
+        self.declare_parameter('segmented_entry_pose_wait_sec', 5.0)
+        self.declare_parameter('segmented_entry_correction_limit_m', 0.15)
+        self.declare_parameter('segmented_entry_max_corrections', 2)
+        self.declare_parameter(
+            'segmented_entry_realign_threshold_rad', 0.0873)
+        # VP2 -> VP3 is an unobstructed ~1.07 m straight leg. After VP2's
+        # final scan heading MPPI intermittently recovery-cycles for 120 s
+        # instead of acquiring that line. Bypass only this known leg through
+        # Nav2's collision-checked Spin + DriveOnHeading behaviors.
+        self.declare_parameter('vp2_to_vp3_segmented', False)
+        self.declare_parameter('segmented_transit_speed_mps', 0.05)
+        self.declare_parameter('segmented_transit_timeout_sec', 35.0)
+        self.declare_parameter('segmented_transit_start_radius_m', 0.15)
+        self.declare_parameter('segmented_transit_xy_tolerance_m', 0.05)
+        self.declare_parameter('segmented_transit_correction_limit_m', 0.25)
+        self.declare_parameter('segmented_transit_max_corrections', 2)
+        self.declare_parameter(
+            'segmented_transit_realign_threshold_rad', 0.0873)
+        self.declare_parameter(
+            'viewpoint_continuity_tolerance_m', 0.065)
         self.declare_parameter('scan_topic', 'scan')
         self.declare_parameter('image_topic', 'camera/image_raw')
         self.declare_parameter('camera_settle_sec', 1.0)
+        # Real robot over WiFi only: a persistent raw-image subscription
+        # saturates the robot's uplink and starves /scan below what AMCL
+        # needs. True = no standing subscription; each capture subscribes,
+        # takes the 3rd frame (first ones can be stale/mid-exposure) and
+        # unsubscribes, so navigation runs with zero image traffic.
+        self.declare_parameter('image_on_demand', False)
+        # A temporal median keeps a stationary 3 cm-class target while
+        # rejecting transient compression noise and people crossing a view.
+        # The legacy single-frame behavior remains the default for sim.
+        self.declare_parameter('image_burst_warmup_frames', 2)
+        self.declare_parameter('image_burst_count', 1)
         self.declare_parameter('report_dir', default_report_dir())
+        self.declare_parameter('report_keep_runs', 10)
         self.declare_parameter('return_home', True)
         self.declare_parameter('home_area', 'charging_station')
         # Per-robot home override (multi-robot: each robot has its own dock;
@@ -105,6 +281,10 @@ class InspectionRunner(Node):
         self.declare_parameter('home_y', float('nan'))
         self.declare_parameter('home_yaw', 0.0)
         self.declare_parameter('return_home_standoff_distance', 0.0)
+        # HOME is a validated wall-adjacent dock. Keep a dedicated dynamic-
+        # obstacle guard smaller than the generic viewpoint guard; Nav2's
+        # footprint/inflation/collision checks remain active throughout.
+        self.declare_parameter('return_home_clearance_radius', 0.15)
         self.declare_parameter('dry_run', False)
         # --- Navigation resilience (B-axis): never collide/hug/deadlock; a
         # blocked area is skipped gracefully so the mission always completes.
@@ -136,11 +316,32 @@ class InspectionRunner(Node):
         # 1500 px floor: real 0.45 m boxes never projected below 2700 px
         # across the rehearsals, the largest surviving artifact was 667 px.
         self.declare_parameter('photo_diff_min_area_px', 1500)
+        self.declare_parameter('photo_diff_min_height_px', 15)
+        self.declare_parameter('photo_diff_min_width_px', 1)
+        self.declare_parameter('photo_diff_morph_kernel_px', 5)
+        # Site-verified stop/yaw -> observed-zone reporting. When enabled,
+        # sectors disabled by the world model are skipped and detections in
+        # ignored zones (notably anomaly_handling) are discarded.
+        self.declare_parameter('photo_diff_report_by_sector', False)
+        # Phase-specific small-object gate. Empty = generic baseline diff;
+        # "red" = the site's graspable red cube, robust to near-wall parallax.
+        self.declare_parameter('photo_target_color', '')
+        self.declare_parameter('photo_target_min_area_px', 150)
+        self.declare_parameter('photo_target_high_hue_min', 175)
+        self.declare_parameter('photo_target_high_hue_saturation_min', 130)
         # Beyond ~3.5 m the ground-intersection geometry degrades (a few
         # pixels of bottom-edge error swing the estimate by metres) and the
         # only regions that big are alignment artifacts.
         self.declare_parameter('photo_diff_max_range', 3.5)
         self.declare_parameter('photo_diff_min_range', 0.3)
+        # Real arena only: fraction of the frame TOP to ignore in the diff.
+        # The physical site's walls are low (~0.35 m vs camera at ~0.25 m),
+        # so the upper image rows see past the arena into an uncontrolled
+        # room. 0.0 (sim default) = full frame; tune on-site from real
+        # captures (start near 0.35) before recording baselines.
+        self.declare_parameter('photo_diff_roi_top_frac', 0.0)
+        self.declare_parameter('photo_diff_roi_side_frac', 0.0)
+        self.declare_parameter('photo_diff_roi_bottom_frac', 0.0)
         # merge_distance: covers the long-range projection scatter of one
         # object seen from several yaws (observed 1.36 m spread on a box
         # at 1.7-1.9 m).
@@ -163,8 +364,14 @@ class InspectionRunner(Node):
 
         action_name = self.get_parameter('action_name').value
         self._client = ActionClient(self, NavigateToPose, action_name)
+        self._spin_client = ActionClient(
+            self, Spin, self.get_parameter('scan_spin_action_name').value)
+        self._drive_client = ActionClient(
+            self, DriveOnHeading,
+            self.get_parameter('segmented_entry_drive_action').value)
         self._latest_scan = None
         self._latest_image = None
+        self._last_capture_meta: dict = {}
         self._latest_costmap = None
         self._latest_static_map = None
         self._camera_info = None
@@ -179,9 +386,15 @@ class InspectionRunner(Node):
         # previous one may still be live server-side is unsafe (preempt race).
         self._nav_aborted = False
         scan_topic = self.get_parameter('scan_topic').value
-        image_topic = self.get_parameter('image_topic').value
-        self.create_subscription(LaserScan, scan_topic, self._scan_callback, 10)
-        self.create_subscription(Image, image_topic, self._image_callback, 10)
+        self._image_topic = self.get_parameter('image_topic').value
+        # BEST_EFFORT to match sensor drivers (LDS-02 publishes sensor-data
+        # QoS); a best-effort subscription still matches RELIABLE sim
+        # publishers, so this is safe in both sim and on the real robot.
+        self.create_subscription(LaserScan, scan_topic, self._scan_callback,
+                                 qos_profile_sensor_data)
+        if not bool(self.get_parameter('image_on_demand').value):
+            self.create_subscription(
+                Image, self._image_topic, self._image_callback, 10)
         self._camera_info = None
         self.create_subscription(
             CameraInfo, self.get_parameter('camera_info_topic').value,
@@ -328,7 +541,11 @@ class InspectionRunner(Node):
         mount_x = float(self.get_parameter('camera_mount_x').value)
         mount_z = float(self.get_parameter('camera_mount_z').value)
         info = self._camera_info
-        if info is None:
+        # Uncalibrated cameras (v4l2_camera with no calibration file)
+        # publish an all-zero K; using it makes the homography/projection
+        # math singular. Treat it like "no camera_info" and fall back to
+        # the default intrinsics until the real calibration lands.
+        if info is None or float(info.k[0]) <= 0.0 or float(info.k[4]) <= 0.0:
             return CameraModel(mount_x=mount_x, mount_z=mount_z)
         return CameraModel(
             fx=float(info.k[0]), fy=float(info.k[4]),
@@ -451,9 +668,19 @@ class InspectionRunner(Node):
                                   'y': stop.get('y', 0.0)},
                          'views': [],
                          'anomalies': []}
+        sector_mode = bool(self.get_parameter(
+            'photo_diff_report_by_sector').value)
         if record:
             recorded = 0
             for yaw_index, sample in stop_samples:
+                sector = inspection_sector(area, stop_label, yaw_index)
+                if sector_mode and (sector is None or not bool(
+                        sector.get('routine_detection_enabled', True))):
+                    outcome['views'].append({
+                        'yaw_index': yaw_index,
+                        'status': 'ignored_sector',
+                    })
+                    continue
                 photo = (sample.get('image_capture') or {}).get('image_path')
                 if not photo:
                     continue
@@ -466,8 +693,24 @@ class InspectionRunner(Node):
                 pose = sample.get('pose_at_capture') or (
                     stop.get('x', 0.0), stop.get('y', 0.0),
                     float(sample.get('yaw', 0.0)))
+                roi_top_frac = float(
+                    self.get_parameter('photo_diff_roi_top_frac').value)
+                roi_side_frac = float(
+                    self.get_parameter('photo_diff_roi_side_frac').value)
+                roi_bottom_frac = float(
+                    self.get_parameter('photo_diff_roi_bottom_frac').value)
                 target.with_suffix('.json').write_text(json.dumps(
-                    {'x': pose[0], 'y': pose[1], 'yaw': pose[2]}))
+                    {
+                        'x': pose[0],
+                        'y': pose[1],
+                        'yaw': pose[2],
+                        'image_roi': {
+                            'type': 'ignore_top_fraction',
+                            'top_fraction': roi_top_frac,
+                            'side_fraction': roi_side_frac,
+                            'bottom_fraction': roi_bottom_frac,
+                        },
+                    }))
                 recorded += 1
             outcome.update({'status': 'baseline_recorded', 'photos': recorded})
             self.get_logger().info(
@@ -480,37 +723,97 @@ class InspectionRunner(Node):
             return outcome
 
         camera = self.camera_model()
+        target_color = normalize_text(str(
+            self.get_parameter('photo_target_color').value or ''))
         bounds = self.detect_bounds(area)
-        clip = bool(area.get('photo_detect_clip_bounds',
-                             self.get_parameter('photo_detect_clip_bounds').value))
+        # Site-verified sector mode deliberately reports only the VP region,
+        # not a fragile projected map coordinate. The legacy shrunken-bounds
+        # clip can discard a real object near an arena edge (v5 VP1/yaw02),
+        # so it applies only to the old coordinate-reporting mode.
+        clip = (not sector_mode and bool(area.get(
+            'photo_detect_clip_bounds',
+            self.get_parameter('photo_detect_clip_bounds').value)))
         min_range = float(area.get(
             'photo_detect_min_range',
             self.get_parameter('photo_diff_min_range').value))
         checked = 0
         found: list[dict] = []
         for yaw_index, sample in stop_samples:
+            sector = inspection_sector(area, stop_label, yaw_index)
+            if sector_mode and (sector is None or not bool(
+                    sector.get('routine_detection_enabled', True))):
+                outcome['views'].append({
+                    'yaw_index': yaw_index,
+                    'status': 'ignored_sector',
+                })
+                continue
             photo = (sample.get('image_capture') or {}).get('image_path')
             base = self.baseline_photo_path(area_key, stop_label, yaw_index)
-            if not photo or not base.exists():
+            if not photo or (target_color != 'red' and not base.exists()):
                 continue
             pose = sample.get('pose_at_capture') or (
                 stop.get('x', 0.0), stop.get('y', 0.0),
                 float(sample.get('yaw', 0.0)))
             base_pose = None
+            roi_top_frac = float(
+                self.get_parameter('photo_diff_roi_top_frac').value)
+            roi_side_frac = float(
+                self.get_parameter('photo_diff_roi_side_frac').value)
+            roi_bottom_frac = float(
+                self.get_parameter('photo_diff_roi_bottom_frac').value)
             base_meta = base.with_suffix('.json')
             if base_meta.exists():
                 try:
                     meta = json.loads(base_meta.read_text())
                     base_pose = (meta['x'], meta['y'], meta['yaw'])
+                    roi = meta.get('image_roi') or {}
+                    if roi.get('type') == 'ignore_top_fraction':
+                        # The baseline defines its own evidence region. This
+                        # prevents a later parameter change from comparing two
+                        # images under different ROI rules.
+                        roi_top_frac = float(roi['top_fraction'])
+                        roi_side_frac = float(roi.get(
+                            'side_fraction', roi_side_frac))
+                        roi_bottom_frac = float(roi.get(
+                            'bottom_fraction', roi_bottom_frac))
                 except (ValueError, KeyError):
                     base_pose = None
-            detection = detect_changes(
-                base, photo, pose, camera,
-                threshold=int(self.get_parameter('photo_diff_threshold').value),
-                tolerance_px=int(self.get_parameter('photo_diff_tolerance_px').value),
-                min_area_px=int(self.get_parameter('photo_diff_min_area_px').value),
-                max_range=float(self.get_parameter('photo_diff_max_range').value),
-                baseline_pose=base_pose, min_range=min_range)
+            if target_color == 'red':
+                detection = detect_red_targets(
+                    photo, pose, camera,
+                    min_area_px=int(self.get_parameter(
+                        'photo_target_min_area_px').value),
+                    max_range=float(self.get_parameter(
+                        'photo_diff_max_range').value),
+                    min_range=min_range,
+                    roi_top_frac=roi_top_frac,
+                    roi_side_frac=roi_side_frac,
+                    roi_bottom_frac=roi_bottom_frac,
+                    min_height_px=int(self.get_parameter(
+                        'photo_diff_min_height_px').value),
+                    min_width_px=int(self.get_parameter(
+                        'photo_diff_min_width_px').value),
+                    hue_high_min=int(self.get_parameter(
+                        'photo_target_high_hue_min').value),
+                    high_hue_saturation_min=int(self.get_parameter(
+                        'photo_target_high_hue_saturation_min').value))
+            else:
+                detection = detect_changes(
+                    base, photo, pose, camera,
+                    threshold=int(self.get_parameter('photo_diff_threshold').value),
+                    tolerance_px=int(self.get_parameter('photo_diff_tolerance_px').value),
+                    min_area_px=int(self.get_parameter('photo_diff_min_area_px').value),
+                    max_range=float(self.get_parameter('photo_diff_max_range').value),
+                    baseline_pose=base_pose, min_range=min_range,
+                    roi_top_frac=roi_top_frac,
+                    roi_side_frac=roi_side_frac,
+                    roi_bottom_frac=roi_bottom_frac,
+                    morph_kernel_px=int(self.get_parameter(
+                        'photo_diff_morph_kernel_px').value),
+                    min_height_px=int(self.get_parameter(
+                        'photo_diff_min_height_px').value),
+                    min_width_px=int(self.get_parameter(
+                        'photo_diff_min_width_px').value))
             checked += 1
             for anomaly in detection['anomalies']:
                 # Bounds clip keeps doorway-leaked sightings of NEIGHBOR
@@ -525,9 +828,42 @@ class InspectionRunner(Node):
                         '%s: change at (%.2f, %.2f) matches a peer robot '
                         'pose, ignored' % (area_key, anomaly['x'], anomaly['y']))
                     continue
+                observed_zone = classify_sector_zone(
+                    sector, anomaly.get('range')) if sector_mode else None
+                if sector_mode:
+                    sector_zones = list((sector or {}).get(
+                        'observed_zones', []))
+                    anomaly['sector_mixed'] = len(sector_zones) > 1
+                    split = (sector or {}).get('zone_split_range_m')
+                    if split is not None and anomaly.get('range') is not None:
+                        anomaly['zone_boundary_margin_m'] = round(abs(
+                            float(anomaly['range']) - float(split)), 3)
+                    ignored_zones = set(
+                        (area.get('inspection_detection_policy') or {}).get(
+                            'ignored_zones', []))
+                    ignored_zones.update((sector or {}).get(
+                        'ignored_zones', []))
+                    if observed_zone in ignored_zones:
+                        outcome['views'].append({
+                            'yaw_index': yaw_index,
+                            'status': 'change_ignored_by_zone',
+                            'observed_zone': observed_zone,
+                            'area_px': anomaly.get('area_px'),
+                        })
+                        continue
+                    if observed_zone:
+                        anomaly['observed_zone'] = observed_zone
+                        anomaly['area'] = observed_zone
+                        anomaly['type'] = ('red_target' if target_color == 'red'
+                                           else 'viewpoint_change')
+                        anomaly['description'] = (
+                            f'{observed_zone}区域发现红色小目标'
+                            if target_color == 'red' else
+                            f'{observed_zone}区域存在持续视觉变化')
                 anomaly['detected_from'] = {
                     'stop': stop_label, 'yaw_index': yaw_index,
-                    'photo': photo}
+                    'photo': photo,
+                    'observed_zone': observed_zone}
                 # Surface the evidence photo on the standard field too, so the
                 # event JSON / GUI / report all carry it (not just detected_from).
                 anomaly['evidence_photo'] = photo
@@ -543,7 +879,11 @@ class InspectionRunner(Node):
         event = {
             'robot': self.robot_name,
             'stamp': stamp,
-            'area': area_key,
+            'area': anomaly.get('observed_zone', area_key),
+            'capture_area': area_key,
+            'capture_stop': (anomaly.get('detected_from') or {}).get('stop'),
+            'capture_yaw_index': (anomaly.get('detected_from') or {}).get(
+                'yaw_index'),
             'x': anomaly['x'],
             'y': anomaly['y'],
             'size': anomaly.get('extent'),
@@ -580,12 +920,25 @@ class InspectionRunner(Node):
         # label is invisible against it.
         label.color.r, label.color.g, label.color.b = 0.8, 0.0, 0.0
         label.color.a = 1.0
-        label.text = f"{area_key} ({anomaly['x']:.2f}, {anomaly['y']:.2f})"
+        zone = str(anomaly.get('observed_zone') or area_key)
+        label.text = f"{zone.upper()} ANOMALY"
         self._marker_pub.publish(MarkerArray(markers=[body, label]))
         self.get_logger().warn(
             'ANOMALY %s in %s at (%.2f, %.2f) extent=%.2f'
             % (self._anomaly_seq, area_key, anomaly['x'], anomaly['y'],
                anomaly.get('extent') or 0.0))
+
+    def clear_anomaly_markers(self) -> None:
+        """Clear stale RViz points before a new stress-test round.
+
+        Marker IDs restart at one for every short-lived runner process. A
+        DELETEALL message prevents a round with fewer anomalies from leaving
+        higher-ID points from the previous round on screen.
+        """
+        marker = Marker()
+        marker.header.frame_id = 'map'
+        marker.action = Marker.DELETEALL
+        self._marker_pub.publish(MarkerArray(markers=[marker]))
 
     # ------------------------------------------------------------------
     # Navigation resilience (B-axis — PRESERVED BYTE-UNCHANGED in logic)
@@ -606,7 +959,12 @@ class InspectionRunner(Node):
             return grid.data[row * info.width + col]
         return None
 
-    def candidate_is_clear(self, x: float, y: float) -> bool:
+    def candidate_is_clear(
+        self,
+        x: float,
+        y: float,
+        clearance_radius: float | None = None,
+    ) -> bool:
         """False only when an UNMAPPED (dynamic) obstacle occupies the candidate
         footprint -- i.e. a costmap cell at lethal cost whose location is FREE
         on the static map.
@@ -632,7 +990,8 @@ class InspectionRunner(Node):
             return True
         lethal = int(self.get_parameter('costmap_lethal_cost').value)
         free_max = int(self.get_parameter('static_free_max').value)
-        radius = float(self.get_parameter('candidate_clearance_radius').value)
+        radius = (float(self.get_parameter('candidate_clearance_radius').value)
+                  if clearance_radius is None else float(clearance_radius))
         steps = max(0, int(radius / info.resolution))
         base_col = math.floor((x - info.origin.position.x) / info.resolution)
         base_row = math.floor((y - info.origin.position.y) / info.resolution)
@@ -642,12 +1001,17 @@ class InspectionRunner(Node):
                 row = base_row + d_row
                 if not (0 <= col < info.width and 0 <= row < info.height):
                     continue
+                wx = info.origin.position.x + (col + 0.5) * info.resolution
+                wy = info.origin.position.y + (row + 0.5) * info.resolution
+                # The index bounds above form a square.  Apply the documented
+                # Euclidean radius as well; otherwise diagonal cells as far as
+                # radius*sqrt(2) away can falsely cancel a safe goal.
+                if not inside_clearance_radius(x, y, wx, wy, radius):
+                    continue
                 if grid.data[row * info.width + col] < lethal:
                     continue
                 # Lethal in the costmap. Only count it as a dynamic obstacle if
                 # the static map does NOT explain it (free floor at that spot).
-                wx = info.origin.position.x + (col + 0.5) * info.resolution
-                wy = info.origin.position.y + (row + 0.5) * info.resolution
                 static_val = self._grid_value(static, wx, wy)
                 if static_val is not None and 0 <= static_val < free_max:
                     return False
@@ -800,7 +1164,11 @@ class InspectionRunner(Node):
                 'navigation to avoid a preempt race.' % result.get('status'))
         return result
 
-    def send_goal_and_wait(self, goal: NavigateToPose.Goal) -> dict:
+    def send_goal_and_wait(
+        self,
+        goal: NavigateToPose.Goal,
+        clearance_radius: float | None = None,
+    ) -> dict:
         timeout = float(self.get_parameter('server_timeout_sec').value)
         if not self._client.wait_for_server(timeout_sec=timeout):
             # No goal was sent -> the server is executing nothing -> safe.
@@ -868,7 +1236,8 @@ class InspectionRunner(Node):
             # navigating, so this never penalises normal (obstacle-free) runs.
             if elapsed - last_blocked_check >= 2.0:
                 last_blocked_check = elapsed
-                if not self.candidate_is_clear(goal_x, goal_y):
+                if not self.candidate_is_clear(
+                        goal_x, goal_y, clearance_radius=clearance_radius):
                     return self._finish(_cancel('goal_blocked'))
             rclpy.spin_once(self, timeout_sec=0.1)
         result = result_future.result()
@@ -923,6 +1292,578 @@ class InspectionRunner(Node):
         while time.time() < end_time:
             rclpy.spin_once(self, timeout_sec=0.05)
 
+    def send_spin_to_map_yaw(self, target_yaw: float) -> dict:
+        """Rotate in place to an absolute map-frame yaw using Nav2 Spin.
+
+        AMCL yaw can lag immediately after rotation, so the current yaw is
+        refined by matching the live laser scan against the static map before
+        calculating the relative Spin command.
+        """
+        wait_deadline = time.time() + 5.0
+        while rclpy.ok() and (
+            self._own_pose is None or self._latest_scan is None
+        ) and time.time() < wait_deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self._own_pose is None or self._latest_scan is None:
+            return {'status': 'sensor_unavailable', 'safe_to_continue': True}
+
+        current_raw = float(self._own_pose[2])
+        current_yaw, fit_ratio = self.corrected_capture_yaw(
+            float(self._own_pose[0]), float(self._own_pose[1]), current_raw)
+        delta = shortest_angular_distance(current_yaw, target_yaw)
+        skip_tolerance = float(
+            self.get_parameter('scan_spin_skip_tolerance_rad').value)
+        if abs(delta) <= skip_tolerance:
+            return {
+                'status': 'succeeded',
+                'mode': 'spin_already_aligned',
+                'target_map_yaw': round(float(target_yaw), 4),
+                'current_map_yaw': round(float(current_yaw), 4),
+                'map_yaw_error': round(float(delta), 4),
+                'yaw_fit_ratio': round(float(fit_ratio), 3),
+                'safe_to_continue': True,
+                'duration_sec': 0.0,
+            }
+
+        timeout = float(self.get_parameter('scan_spin_timeout_sec').value)
+        if not self._spin_client.wait_for_server(timeout_sec=10.0):
+            return {'status': 'spin_server_unavailable',
+                    'safe_to_continue': True}
+        scale = float(self.get_parameter('scan_spin_command_scale').value)
+        command = calibrated_spin_command(current_yaw, target_yaw, scale)
+        goal = Spin.Goal()
+        goal.target_yaw = float(command)
+        goal.time_allowance = Duration(sec=max(1, int(math.ceil(timeout))))
+        started = time.time()
+        send_future = self._spin_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=10.0)
+        if (not send_future.done() or send_future.result() is None
+                or not send_future.result().accepted):
+            return {
+                'status': 'spin_rejected',
+                'safe_to_continue': True,
+                'duration_sec': round(time.time() - started, 3),
+            }
+
+        handle = send_future.result()
+        result_future = handle.get_result_async()
+        terminal = self._await_terminal(result_future, timeout + 5.0)
+        if not terminal:
+            cancel_future = handle.cancel_goal_async()
+            rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=5.0)
+            terminal = self._await_terminal(result_future, 5.0)
+            result = {
+                'status': 'spin_timeout',
+                'cancel_terminal': 'confirmed' if terminal else 'unconfirmed',
+                'safe_to_continue': terminal,
+                'duration_sec': round(time.time() - started, 3),
+            }
+            return self._finish(result)
+
+        action_result = result_future.result()
+        status = STATUS_TEXT.get(action_result.status, str(action_result.status))
+        return {
+            'status': status,
+            'mode': 'spin_action',
+            'target_map_yaw': round(float(target_yaw), 4),
+            'current_map_yaw': round(float(current_yaw), 4),
+            'map_yaw_error': round(float(delta), 4),
+            'spin_command_rad': round(float(command), 4),
+            'yaw_fit_ratio': round(float(fit_ratio), 3),
+            'safe_to_continue': True,
+            'duration_sec': round(time.time() - started, 3),
+        }
+
+    def send_relative_scan_spin(
+        self,
+        command_rad: float,
+        target_yaw: float,
+    ) -> dict:
+        """Execute one calibrated relative scan step.
+
+        After the first absolute heading is acquired, all remaining scan
+        headings use this fixed odometry-relative command. This prevents AMCL
+        convergence jumps during rotation from changing the physical spacing
+        of subsequent camera views.
+        """
+        timeout = float(self.get_parameter('scan_spin_timeout_sec').value)
+        if not self._spin_client.wait_for_server(timeout_sec=10.0):
+            return {'status': 'spin_server_unavailable',
+                    'safe_to_continue': True}
+        goal = Spin.Goal()
+        goal.target_yaw = float(command_rad)
+        goal.time_allowance = Duration(sec=max(1, int(math.ceil(timeout))))
+        started = time.time()
+        send_future = self._spin_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=10.0)
+        if (not send_future.done() or send_future.result() is None
+                or not send_future.result().accepted):
+            return {
+                'status': 'spin_rejected',
+                'safe_to_continue': True,
+                'duration_sec': round(time.time() - started, 3),
+            }
+
+        handle = send_future.result()
+        result_future = handle.get_result_async()
+        terminal = self._await_terminal(result_future, timeout + 5.0)
+        if not terminal:
+            cancel_future = handle.cancel_goal_async()
+            rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=5.0)
+            terminal = self._await_terminal(result_future, 5.0)
+            return self._finish({
+                'status': 'spin_timeout',
+                'cancel_terminal': 'confirmed' if terminal else 'unconfirmed',
+                'safe_to_continue': terminal,
+                'duration_sec': round(time.time() - started, 3),
+            })
+
+        action_result = result_future.result()
+        status = STATUS_TEXT.get(action_result.status, str(action_result.status))
+        return {
+            'status': status,
+            'mode': 'spin_relative_calibrated',
+            'target_map_yaw': round(float(target_yaw), 4),
+            'spin_command_rad': round(float(command_rad), 4),
+            'safe_to_continue': True,
+            'duration_sec': round(time.time() - started, 3),
+        }
+
+    def send_scan_spin_with_retries(
+        self,
+        first_heading: bool,
+        target_yaw: float,
+    ) -> dict:
+        """Retry a safely terminated transient Spin without skipping safety."""
+        max_attempts = max(1, int(
+            self.get_parameter('scan_spin_max_attempts').value))
+        history = []
+        for attempt in range(1, max_attempts + 1):
+            if first_heading:
+                result = self.send_spin_to_map_yaw(target_yaw)
+            else:
+                result = self.send_relative_scan_spin(
+                    float(self.get_parameter('scan_spin_step_rad').value),
+                    target_yaw)
+            history.append({'attempt': attempt, **result})
+            if result.get('status') == 'succeeded':
+                final = dict(result)
+                final['attempt'] = attempt
+                if attempt > 1:
+                    final['retry_history'] = history
+                return final
+            if not result.get('safe_to_continue', True):
+                break
+            if attempt < max_attempts:
+                self.get_logger().warn(
+                    'Scan Spin target yaw %.4f returned terminal status %s; '
+                    'waiting for fresh TF/footprint and retrying (%d/%d).'
+                    % (target_yaw, result.get('status'),
+                       attempt + 1, max_attempts))
+                self.wait_for_sensor_settle()
+        final = dict(history[-1])
+        final['attempts'] = history
+        return final
+
+    def send_drive_on_heading(self, distance_m: float,
+                              speed_mps: float | None = None,
+                              timeout_sec: float | None = None) -> dict:
+        """Collision-checked straight motion through Nav2 behavior_server."""
+        timeout = (float(timeout_sec) if timeout_sec is not None else float(
+            self.get_parameter('segmented_entry_timeout_sec').value))
+        if distance_m <= 0.005:
+            return {'status': 'succeeded', 'mode': 'drive_already_reached',
+                    'distance_m': round(float(distance_m), 4),
+                    'safe_to_continue': True, 'duration_sec': 0.0}
+        if not self._drive_client.wait_for_server(timeout_sec=10.0):
+            return {'status': 'drive_server_unavailable',
+                    'safe_to_continue': True}
+        goal = DriveOnHeading.Goal()
+        goal.target.x = float(distance_m)
+        goal.speed = (float(speed_mps) if speed_mps is not None else float(
+            self.get_parameter('segmented_entry_speed_mps').value))
+        goal.time_allowance = Duration(sec=max(1, int(math.ceil(timeout))))
+        started = time.time()
+        send_future = self._drive_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=10.0)
+        if (not send_future.done() or send_future.result() is None
+                or not send_future.result().accepted):
+            return {'status': 'drive_rejected', 'safe_to_continue': True,
+                    'duration_sec': round(time.time() - started, 3)}
+        handle = send_future.result()
+        result_future = handle.get_result_async()
+        terminal = self._await_terminal(result_future, timeout + 5.0)
+        if not terminal:
+            cancel_future = handle.cancel_goal_async()
+            rclpy.spin_until_future_complete(self, cancel_future,
+                                             timeout_sec=5.0)
+            terminal = self._await_terminal(result_future, 5.0)
+            return self._finish({
+                'status': 'drive_timeout',
+                'cancel_terminal': 'confirmed' if terminal else 'unconfirmed',
+                'safe_to_continue': terminal,
+                'distance_m': round(float(distance_m), 4),
+                'duration_sec': round(time.time() - started, 3),
+            })
+        action_result = result_future.result()
+        return {
+            'status': STATUS_TEXT.get(
+                action_result.status, str(action_result.status)),
+            'mode': 'drive_on_heading',
+            'distance_m': round(float(distance_m), 4),
+            'speed_mps': round(float(goal.speed), 3),
+            'safe_to_continue': True,
+            'duration_sec': round(time.time() - started, 3),
+        }
+
+    def home_to_vp1_segmented_result(self, stop: dict) -> dict | None:
+        """Home -> VP1 as X-line, in-place turn, then Y-line.
+
+        Returns None when the special entry is disabled/not applicable so the
+        caller can fall back to NavigateToPose. Distances use live AMCL after
+        every segment, absorbing centimetres of manual Home placement error.
+        """
+        if not bool(self.get_parameter('home_to_vp1_segmented').value):
+            return None
+        if str(stop.get('label')) != 'viewpoint_1':
+            return None
+        # AMCL is a live topic, unlike the latched map/costmap inputs.  A newly
+        # started one-shot runner can reach the first stop before its first
+        # AMCL callback; immediately returning None here silently selects the
+        # slow NavigateToPose fallback even though the robot is at Home.  Give
+        # the initial pose a short bounded window to arrive before deciding
+        # whether the segmented entry is applicable.
+        pose_deadline = time.time() + max(0.0, float(self.get_parameter(
+            'segmented_entry_pose_wait_sec').value))
+        while self._own_pose is None and time.time() < pose_deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self._own_pose is None:
+            self.get_logger().warn(
+                'Home -> VP1 segmented entry unavailable: no AMCL pose')
+            return None
+        home = (self._world_model.get('robot_start') or {}).get('pose') or {}
+        if not all(key in home for key in ('x', 'y', 'yaw')):
+            return None
+        start = tuple(float(value) for value in self._own_pose)
+        if math.hypot(start[0] - float(home['x']),
+                      start[1] - float(home['y'])) > float(self.get_parameter(
+                          'segmented_entry_home_radius_m').value):
+            return None
+
+        started = time.time()
+        segments = []
+        first_yaw = float(home['yaw'])
+        align = self.send_spin_to_map_yaw(first_yaw)
+        segments.append({'stage': 'align_home_heading', **align})
+        if align.get('status') != 'succeeded' or self._own_pose is None:
+            return {'status': 'segmented_align_failed',
+                    'safe_to_continue': align.get('safe_to_continue', True),
+                    'mode': 'home_to_vp1_segmented', 'segments': segments,
+                    'duration_sec': round(time.time() - started, 3)}
+
+        pose = tuple(float(value) for value in self._own_pose)
+        cos_first = math.cos(first_yaw)
+        if abs(cos_first) < 0.5:
+            return {'status': 'segmented_invalid_home_heading',
+                    'safe_to_continue': True,
+                    'mode': 'home_to_vp1_segmented', 'segments': segments,
+                    'duration_sec': round(time.time() - started, 3)}
+        first_distance = (float(stop['x']) - pose[0]) / cos_first
+        if first_distance < -0.005:
+            return None
+        first = self.send_drive_on_heading(max(0.0, first_distance))
+        segments.append({'stage': 'x_straight', **first})
+        if first.get('status') != 'succeeded' or self._own_pose is None:
+            return {'status': 'segmented_first_drive_failed',
+                    'safe_to_continue': first.get('safe_to_continue', True),
+                    'mode': 'home_to_vp1_segmented', 'segments': segments,
+                    'duration_sec': round(time.time() - started, 3)}
+
+        pose = tuple(float(value) for value in self._own_pose)
+        turn_yaw = (-math.pi / 2.0 if float(stop['y']) < pose[1]
+                    else math.pi / 2.0)
+        turn = self.send_spin_to_map_yaw(turn_yaw)
+        segments.append({'stage': 'corner_turn', **turn})
+        if turn.get('status') != 'succeeded' or self._own_pose is None:
+            return {'status': 'segmented_turn_failed',
+                    'safe_to_continue': turn.get('safe_to_continue', True),
+                    'mode': 'home_to_vp1_segmented', 'segments': segments,
+                    'duration_sec': round(time.time() - started, 3)}
+
+        pose = tuple(float(value) for value in self._own_pose)
+        second_distance = ((float(stop['y']) - pose[1])
+                           / math.sin(turn_yaw))
+        if second_distance < -0.005:
+            return {'status': 'segmented_overshot_corner',
+                    'safe_to_continue': True,
+                    'mode': 'home_to_vp1_segmented', 'segments': segments,
+                    'duration_sec': round(time.time() - started, 3)}
+        second = self.send_drive_on_heading(max(0.0, second_distance))
+        segments.append({'stage': 'y_straight', **second})
+        if second.get('status') != 'succeeded' or self._own_pose is None:
+            return {'status': 'segmented_second_drive_failed',
+                    'safe_to_continue': second.get('safe_to_continue', True),
+                    'mode': 'home_to_vp1_segmented', 'segments': segments,
+                    'duration_sec': round(time.time() - started, 3)}
+
+        pose = tuple(float(value) for value in self._own_pose)
+        error = math.hypot(pose[0] - float(stop['x']),
+                           pose[1] - float(stop['y']))
+        tolerance = float(self.get_parameter(
+            'segmented_entry_xy_tolerance_m').value)
+        correction_limit = float(self.get_parameter(
+            'segmented_entry_correction_limit_m').value)
+        max_corrections = max(0, int(self.get_parameter(
+            'segmented_entry_max_corrections').value))
+        # The orthogonal entry deliberately avoids MPPI's long correction
+        # cycle, but DriveOnHeading terminates from odometry and can leave a
+        # repeatable 6--8 cm AMCL miss.  Correct only a bounded near-goal miss
+        # with the same collision-checked Spin + DriveOnHeading primitives.
+        # The strict final tolerance is unchanged; a larger miss remains a
+        # hard failure instead of being hidden by a relaxed acceptance band.
+        for correction_index in range(1, max_corrections + 1):
+            if error <= tolerance or error > correction_limit:
+                break
+            heading, _distance = direct_heading_and_distance(
+                pose, float(stop['x']), float(stop['y']))
+            align = self.send_spin_to_map_yaw(heading)
+            segments.append({
+                'stage': f'vp1_correction_align_{correction_index}', **align})
+            if align.get('status') != 'succeeded' or self._own_pose is None:
+                return {
+                    'status': 'segmented_correction_align_failed',
+                    'safe_to_continue': align.get('safe_to_continue', True),
+                    'mode': 'home_to_vp1_segmented',
+                    'segments': segments,
+                    'duration_sec': round(time.time() - started, 3),
+                }
+            pose = tuple(float(value) for value in self._own_pose)
+            refined_heading, distance = direct_heading_and_distance(
+                pose, float(stop['x']), float(stop['y']))
+            # A large in-place turn can make AMCL update XY.  Re-aim once
+            # when that update materially changes the live VP1 goal vector;
+            # otherwise DriveOnHeading would use the stale pre-spin heading.
+            realign_threshold = float(self.get_parameter(
+                'segmented_entry_realign_threshold_rad').value)
+            heading_shift = abs(shortest_angular_distance(
+                pose[2], refined_heading))
+            if heading_shift > realign_threshold:
+                realign = self.send_spin_to_map_yaw(refined_heading)
+                segments.append({
+                    'stage': f'vp1_correction_realign_{correction_index}',
+                    'post_spin_heading_shift_rad': round(heading_shift, 4),
+                    **realign,
+                })
+                if (realign.get('status') != 'succeeded'
+                        or self._own_pose is None):
+                    return {
+                        'status': 'segmented_correction_realign_failed',
+                        'safe_to_continue': realign.get(
+                            'safe_to_continue', True),
+                        'mode': 'home_to_vp1_segmented',
+                        'segments': segments,
+                        'duration_sec': round(time.time() - started, 3),
+                    }
+                pose = tuple(float(value) for value in self._own_pose)
+                refined_heading, distance = direct_heading_and_distance(
+                    pose, float(stop['x']), float(stop['y']))
+            correction = self.send_drive_on_heading(
+                distance,
+                speed_mps=float(self.get_parameter(
+                    'segmented_entry_speed_mps').value),
+                timeout_sec=min(15.0, float(self.get_parameter(
+                    'segmented_entry_timeout_sec').value)),
+            )
+            segments.append({
+                'stage': f'vp1_correction_drive_{correction_index}',
+                'target_heading': round(refined_heading, 4), **correction})
+            if (correction.get('status') != 'succeeded'
+                    or self._own_pose is None):
+                return {
+                    'status': 'segmented_correction_drive_failed',
+                    'safe_to_continue': correction.get(
+                        'safe_to_continue', True),
+                    'mode': 'home_to_vp1_segmented',
+                    'segments': segments,
+                    'duration_sec': round(time.time() - started, 3),
+                }
+            pose = tuple(float(value) for value in self._own_pose)
+            error = math.hypot(pose[0] - float(stop['x']),
+                               pose[1] - float(stop['y']))
+        return {
+            'status': 'succeeded' if error <= tolerance
+                      else 'segmented_xy_miss',
+            'safe_to_continue': True,
+            'mode': 'home_to_vp1_segmented',
+            'segments': segments,
+            'final_pose': [round(value, 4) for value in pose],
+            'xy_error_m': round(error, 4),
+            'xy_tolerance_m': tolerance,
+            'duration_sec': round(time.time() - started, 3),
+        }
+
+    def vp2_to_vp3_segmented_result(self, stop: dict) -> dict | None:
+        """Enter VP3 from VP2 by aligning once and driving the clear line.
+
+        This is selected only when AMCL confirms that the robot is still at
+        the authored VP2. DriveOnHeading continuously checks the local
+        costmap, so a newly introduced obstacle aborts instead of turning this
+        into open-loop motion.
+        """
+        if not bool(self.get_parameter('vp2_to_vp3_segmented').value):
+            return None
+        if str(stop.get('label')) != 'viewpoint_3' or self._own_pose is None:
+            return None
+        arena = ((self._world_model.get('areas') or {}).get('arena') or {})
+        viewpoints = list(arena.get('viewpoints') or [])
+        if len(viewpoints) < 2:
+            return None
+        vp2 = viewpoints[1]
+        start = tuple(float(value) for value in self._own_pose)
+        start_error = math.hypot(start[0] - float(vp2['x']),
+                                 start[1] - float(vp2['y']))
+        start_radius = float(self.get_parameter(
+            'segmented_transit_start_radius_m').value)
+        if start_error > start_radius:
+            return None
+
+        started = time.time()
+        segments = []
+        heading, _distance = direct_heading_and_distance(
+            start, float(stop['x']), float(stop['y']))
+        align = self.send_spin_to_map_yaw(heading)
+        segments.append({'stage': 'align_vp3_line', **align})
+        if align.get('status') != 'succeeded' or self._own_pose is None:
+            return {
+                'status': 'segmented_align_failed',
+                'safe_to_continue': align.get('safe_to_continue', True),
+                'mode': 'vp2_to_vp3_segmented',
+                'segments': segments,
+                'duration_sec': round(time.time() - started, 3),
+            }
+
+        # Recompute after the spin so centimetres of localization drift do not
+        # turn into a systematic endpoint error over the one-metre leg.
+        pose = tuple(float(value) for value in self._own_pose)
+        heading, distance = direct_heading_and_distance(
+            pose, float(stop['x']), float(stop['y']))
+        drive = self.send_drive_on_heading(
+            distance,
+            speed_mps=float(self.get_parameter(
+                'segmented_transit_speed_mps').value),
+            timeout_sec=float(self.get_parameter(
+                'segmented_transit_timeout_sec').value),
+        )
+        segments.append({'stage': 'vp2_vp3_straight',
+                         'target_heading': round(heading, 4), **drive})
+        if drive.get('status') != 'succeeded' or self._own_pose is None:
+            return {
+                'status': 'segmented_drive_failed',
+                'safe_to_continue': drive.get('safe_to_continue', True),
+                'mode': 'vp2_to_vp3_segmented',
+                'segments': segments,
+                'duration_sec': round(time.time() - started, 3),
+            }
+
+        tolerance = float(self.get_parameter(
+            'segmented_transit_xy_tolerance_m').value)
+        correction_limit = float(self.get_parameter(
+            'segmented_transit_correction_limit_m').value)
+        max_corrections = max(0, int(self.get_parameter(
+            'segmented_transit_max_corrections').value))
+        pose = tuple(float(value) for value in self._own_pose)
+        error = math.hypot(pose[0] - float(stop['x']),
+                           pose[1] - float(stop['y']))
+        # DriveOnHeading holds an odometric heading, but the one-metre real
+        # leg can accumulate ~0.13 m of lateral AMCL error.  Correct only a
+        # bounded near-goal miss: re-aim from the live pose and make a short,
+        # collision-checked leg.  A larger miss remains a hard failure.
+        for correction_index in range(1, max_corrections + 1):
+            if error <= tolerance or error > correction_limit:
+                break
+            heading, distance = direct_heading_and_distance(
+                pose, float(stop['x']), float(stop['y']))
+            align = self.send_spin_to_map_yaw(heading)
+            segments.append({
+                'stage': f'vp3_correction_align_{correction_index}', **align})
+            if align.get('status') != 'succeeded' or self._own_pose is None:
+                return {
+                    'status': 'segmented_correction_align_failed',
+                    'safe_to_continue': align.get('safe_to_continue', True),
+                    'mode': 'vp2_to_vp3_segmented',
+                    'segments': segments,
+                    'duration_sec': round(time.time() - started, 3),
+                }
+            pose = tuple(float(value) for value in self._own_pose)
+            refined_heading, distance = direct_heading_and_distance(
+                pose, float(stop['x']), float(stop['y']))
+            # AMCL can shift XY by several centimetres while the robot spins,
+            # especially beside the VP3 wall.  The old code recomputed only
+            # the distance after that shift and then drove along the stale
+            # pre-spin heading.  In the 2026-08-11 failure this turned a 6 cm
+            # correction into another 5.73 cm miss.  Re-aim once when the
+            # live post-spin vector differs materially; collision checking is
+            # preserved because this remains a Nav2 Spin action.
+            realign_threshold = float(self.get_parameter(
+                'segmented_transit_realign_threshold_rad').value)
+            heading_shift = abs(shortest_angular_distance(
+                pose[2], refined_heading))
+            if heading_shift > realign_threshold:
+                realign = self.send_spin_to_map_yaw(refined_heading)
+                segments.append({
+                    'stage': f'vp3_correction_realign_{correction_index}',
+                    'post_spin_heading_shift_rad': round(heading_shift, 4),
+                    **realign,
+                })
+                if (realign.get('status') != 'succeeded'
+                        or self._own_pose is None):
+                    return {
+                        'status': 'segmented_correction_realign_failed',
+                        'safe_to_continue': realign.get(
+                            'safe_to_continue', True),
+                        'mode': 'vp2_to_vp3_segmented',
+                        'segments': segments,
+                        'duration_sec': round(time.time() - started, 3),
+                    }
+                pose = tuple(float(value) for value in self._own_pose)
+                refined_heading, distance = direct_heading_and_distance(
+                    pose, float(stop['x']), float(stop['y']))
+            correction = self.send_drive_on_heading(
+                distance,
+                speed_mps=float(self.get_parameter(
+                    'segmented_transit_speed_mps').value),
+                timeout_sec=min(15.0, float(self.get_parameter(
+                    'segmented_transit_timeout_sec').value)),
+            )
+            segments.append({
+                'stage': f'vp3_correction_drive_{correction_index}',
+                'target_heading': round(refined_heading, 4), **correction})
+            if (correction.get('status') != 'succeeded'
+                    or self._own_pose is None):
+                return {
+                    'status': 'segmented_correction_drive_failed',
+                    'safe_to_continue': correction.get(
+                        'safe_to_continue', True),
+                    'mode': 'vp2_to_vp3_segmented',
+                    'segments': segments,
+                    'duration_sec': round(time.time() - started, 3),
+                }
+            pose = tuple(float(value) for value in self._own_pose)
+            error = math.hypot(pose[0] - float(stop['x']),
+                               pose[1] - float(stop['y']))
+        return {
+            'status': 'succeeded' if error <= tolerance
+                      else 'segmented_xy_miss',
+            'safe_to_continue': True,
+            'mode': 'vp2_to_vp3_segmented',
+            'segments': segments,
+            'start_error_m': round(start_error, 4),
+            'final_pose': [round(value, 4) for value in pose],
+            'xy_error_m': round(error, 4),
+            'xy_tolerance_m': tolerance,
+            'duration_sec': round(time.time() - started, 3),
+        }
+
     def collect_scan_sample(
         self,
         x: float,
@@ -931,9 +1872,11 @@ class InspectionRunner(Node):
         area_key: str,
         area_dir: Path,
         index: int,
+        motion_result: dict | None = None,
     ) -> dict:
-        goal = self.build_goal(x, y, yaw)
-        nav_result = self.send_goal_and_wait(goal)
+        if motion_result is None:
+            goal = self.build_goal(x, y, yaw)
+            motion_result = self.send_goal_and_wait(goal)
         self.wait_for_sensor_settle()
         summary = summarize_scan(self._latest_scan)
         image_capture = self.capture_image(area_key, area_dir, index, yaw)
@@ -953,7 +1896,7 @@ class InspectionRunner(Node):
         summary.update({
             'index': index,
             'yaw': round(float(yaw), 4),
-            'turn_result': nav_result,
+            'turn_result': motion_result,
             'pose_at_capture': (observed_pose[0], observed_pose[1], corrected_yaw),
             'capture_pose_source': pose_source,
             'yaw_correction': round(corrected_yaw - observed_pose[2], 4),
@@ -974,6 +1917,7 @@ class InspectionRunner(Node):
         # (a few inward yaws) instead of the default 360-degree sweep.
         scan_yaws = [float(value) for value in
                      (area.get('scan_yaws') or self.get_parameter('scan_yaws').value)]
+        scan_yaw_indices = authored_scan_yaw_indices(area, len(scan_yaws))
         area_dir = self.area_evidence_dir(sequence_index, area_key)
         result = {
             'sequence_index': sequence_index,
@@ -988,6 +1932,7 @@ class InspectionRunner(Node):
             'candidate_attempt_limit': int(self.get_parameter('max_candidate_attempts_per_area').value),
             'candidate_spread_ratio': float(self.get_parameter('candidate_spread_ratio').value),
             'scan_sequence': [round(yaw, 4) for yaw in scan_yaws],
+            'scan_yaw_indices': scan_yaw_indices,
             'scan_samples': [],
             'photo_diff': {
                 'status': 'not_run',
@@ -1112,10 +2057,94 @@ class InspectionRunner(Node):
         sample_seq = 0
         for stop in stops:
             stop_label = stop.get('label', 'stop')
-            for yaw_index, yaw in enumerate(scan_yaws):
+            if viewpoint_mode:
+                # Enter the stop through its AUTHORED yaw before sweeping:
+                # the travel goal then matches the pose the viewpoint was
+                # validated with. Travelling straight to (x, y, scan_yaws[0])
+                # changes MPPI's final-approach geometry enough to stall on
+                # wall-adjacent stops (real arena: face-center entry passed
+                # 5/5 while the yaw=0 entry recovery-cycled to timeout).
+                entry_result = self.home_to_vp1_segmented_result(stop)
+                if entry_result is None:
+                    entry_result = self.vp2_to_vp3_segmented_result(stop)
+                if entry_result is None:
+                    entry_result = self.send_goal_and_wait(self.build_goal(
+                        stop['x'], stop['y'], float(stop.get('yaw', 0.0))))
+                result['nav_attempts'].append(
+                    {'label': stop_label, 'x': stop['x'], 'y': stop['y'],
+                     'entry': True, 'result': entry_result})
+                if self._nav_aborted:
+                    result['scan_summary'] = aggregate_scan_summaries(
+                        result['scan_samples'])
+                    result['status'] = 'nav_aborted'
+                    result['reason'] = 'nav_goal_unconfirmed_terminal'
+                    return result
+                continuity_tolerance = float(self.get_parameter(
+                    'viewpoint_continuity_tolerance_m').value)
+                if recoverable_viewpoint_near_miss(
+                        entry_result, continuity_tolerance):
+                    strict_status = entry_result['status']
+                    entry_result['strict_arrival_status'] = strict_status
+                    entry_result['status'] = 'succeeded_near_tolerance'
+                    entry_result['continuity_override'] = True
+                    warning = {
+                        'stop': stop_label,
+                        'strict_status': strict_status,
+                        'xy_error_m': entry_result.get('xy_error_m'),
+                        'strict_xy_tolerance_m': entry_result.get(
+                            'xy_tolerance_m'),
+                        'continuity_tolerance_m': continuity_tolerance,
+                    }
+                    result.setdefault('continuity_warnings', []).append(warning)
+                    self.get_logger().warn(
+                        '%s %s arrival missed strict XY by %.3f m but is '
+                        'safely stopped within %.3f m; continuing scan for '
+                        'workflow continuity'
+                        % (area_key, stop_label,
+                           float(entry_result['xy_error_m']) -
+                           float(entry_result['xy_tolerance_m']),
+                           continuity_tolerance))
+                # A required viewpoint is evidence geometry, not merely a
+                # convenient navigation waypoint. Never rotate/capture after a
+                # timeout, cancellation or abort: photos taken from an unknown
+                # XY silently poison both sector labels and projected marker
+                # positions. The mission-level policy will mark this round as
+                # failed and attempt the normal return-home path.
+                if entry_result.get('status') not in {
+                        'succeeded', 'succeeded_near_tolerance'}:
+                    result['scan_summary'] = aggregate_scan_summaries(
+                        result['scan_samples'])
+                    result['status'] = 'nav_failed'
+                    result['reason'] = 'required_viewpoint_entry_failed'
+                    result['failed_stop'] = {
+                        'label': stop_label,
+                        'x': stop['x'],
+                        'y': stop['y'],
+                        'nav_status': entry_result.get('status'),
+                    }
+                    return result
+            for sequence_yaw_index, (yaw_index, yaw) in enumerate(zip(
+                    scan_yaw_indices, scan_yaws)):
                 sample_seq += 1
                 self.get_logger().info(
                     'Inspecting %s/%s yaw=%.4f' % (area_key, stop_label, yaw))
+                motion_result = None
+                if (viewpoint_mode and bool(
+                        self.get_parameter('scan_use_spin_action').value)):
+                    motion_result = self.send_scan_spin_with_retries(
+                        sequence_yaw_index == 0, yaw)
+                    if motion_result.get('status') != 'succeeded':
+                        result['scan_summary'] = aggregate_scan_summaries(
+                            result['scan_samples'])
+                        result['status'] = 'scan_failed'
+                        result['reason'] = motion_result.get('status')
+                        result['failed_scan'] = {
+                            'stop': stop_label,
+                            'yaw_index': yaw_index,
+                            'yaw': round(yaw, 4),
+                            'result': motion_result,
+                        }
+                        return result
                 sample = self.collect_scan_sample(
                     stop['x'],
                     stop['y'],
@@ -1123,6 +2152,7 @@ class InspectionRunner(Node):
                     area_key,
                     area_dir,
                     sample_seq,
+                    motion_result=motion_result,
                 )
                 # Annotate sample with stop/yaw metadata for photo_diff_stop lookup
                 sample['stop_label'] = stop_label
@@ -1152,6 +2182,30 @@ class InspectionRunner(Node):
                     stop = stop_by_label.get(src.get('stop'), selected)
                     self.publish_anomaly(area_key, anomaly,
                                          {'x': stop['x'], 'y': stop['y']})
+
+        if (viewpoint_mode and stops and scan_yaws and bool(
+                self.get_parameter(
+                    'restore_final_viewpoint_scan_yaw').value)):
+            attempts = max(1, int(self.get_parameter(
+                'restore_final_viewpoint_scan_yaw_attempts').value))
+            restore_history = []
+            for attempt in range(1, attempts + 1):
+                restore = self.send_spin_to_map_yaw(scan_yaws[0])
+                restore_history.append({'attempt': attempt, **restore})
+                if restore.get('status') == 'succeeded':
+                    break
+                if not restore.get('safe_to_continue', True):
+                    break
+                self.get_logger().warn(
+                    'Final viewpoint heading restore attempt %d/%d returned '
+                    '%s; goal is terminal, retrying without aborting the '
+                    'completed inspection.' % (
+                        attempt, attempts, restore.get('status')))
+            result['final_scan_heading_restore'] = {
+                'target_yaw': round(float(scan_yaws[0]), 4),
+                'status': restore_history[-1].get('status'),
+                'attempts': restore_history,
+            }
 
         result['scan_summary'] = aggregate_scan_summaries(result['scan_samples'])
         # Observability: a stop we navigated to and photographed but for which NO
@@ -1199,6 +2253,7 @@ class InspectionRunner(Node):
                 'x': home_x,
                 'y': home_y,
                 'yaw': float(self.get_parameter('home_yaw').value),
+                'arrival_orientation_required': True,
                 'standoff_distance': 0.0,
             }
 
@@ -1213,6 +2268,8 @@ class InspectionRunner(Node):
                 'x': float(start_pose['x']) - math.cos(yaw) * standoff,
                 'y': float(start_pose['y']) - math.sin(yaw) * standoff,
                 'yaw': yaw,
+                'arrival_orientation_required': bool(
+                    robot_start.get('arrival_orientation_required', False)),
                 'standoff_distance': round(standoff, 3),
                 'dock_pose': {
                     'x': round(float(start_pose['x']), 3),
@@ -1232,6 +2289,7 @@ class InspectionRunner(Node):
                     'x': float(center[0]),
                     'y': float(center[1]),
                     'yaw': 0.0,
+                    'arrival_orientation_required': False,
                     'standoff_distance': 0.0,
                 }
 
@@ -1258,6 +2316,8 @@ class InspectionRunner(Node):
         }
         result['source'] = pose.get('source')
         result['standoff_distance'] = pose.get('standoff_distance')
+        result['arrival_orientation_required'] = bool(
+            pose.get('arrival_orientation_required', False))
         if pose.get('dock_pose'):
             result['dock_pose'] = pose['dock_pose']
         if dry_run:
@@ -1274,7 +2334,20 @@ class InspectionRunner(Node):
             'Returning home: x=%.3f y=%.3f yaw=%.4f'
             % (pose['x'], pose['y'], pose['yaw'])
         )
-        nav_result = self.send_goal_and_wait(self.build_goal(pose['x'], pose['y'], pose['yaw']))
+        nav_result = self.send_goal_and_wait(
+            self.build_goal(pose['x'], pose['y'], pose['yaw']),
+            clearance_radius=float(self.get_parameter(
+                'return_home_clearance_radius').value),
+        )
+        if (nav_result.get('status') == 'succeeded'
+                and pose.get('arrival_orientation_required')):
+            self.wait_for_sensor_settle()
+            orientation_result = self.send_spin_to_map_yaw(float(pose['yaw']))
+            result['orientation_result'] = orientation_result
+            nav_result['orientation_result'] = orientation_result
+            if orientation_result.get('status') != 'succeeded':
+                nav_result['xy_status'] = 'succeeded'
+                nav_result['status'] = 'home_orientation_failed'
         result['result'] = nav_result
         return result
 
@@ -1352,6 +2425,7 @@ class InspectionRunner(Node):
         dry_run = bool(self.get_parameter('dry_run').value)
         route = [area_key for area_key, _area in resolved]
         run_dir = self.create_run_dir(route)
+        self.clear_anomaly_markers()
 
         report = {
             'task': 'inspect_route' if len(resolved) > 1 else 'inspect_area',
@@ -1383,7 +2457,8 @@ class InspectionRunner(Node):
             report['areas'].append(area_result)
 
         checked = [area for area in report['areas'] if area.get('status') == 'checked']
-        failed = [area for area in report['areas'] if area.get('status') == 'nav_failed']
+        failed = [area for area in report['areas']
+                  if area.get('status') in {'nav_failed', 'scan_failed'}]
         unchecked = [area for area in report['areas'] if area.get('status') == 'unchecked']
         aborted = [area for area in report['areas'] if area.get('status') == 'nav_aborted']
         no_baseline = [area for area in report['areas']
@@ -1433,7 +2508,9 @@ class InspectionRunner(Node):
         self.get_logger().info('Inspection report written: %s' % md_path)
         # 6. report.yaml is no longer written. Retention: keep 10 newest runs.
         if not dry_run:
-            prune_report_dirs(run_dir.parent, 'inspection_*', keep=10)
+            prune_report_dirs(
+                run_dir.parent, 'inspection_*',
+                keep=max(1, int(self.get_parameter('report_keep_runs').value)))
         return 0 if report['status'] in {'completed', 'dry_run'} else 5
 
     def capture_nav_fail_evidence(self, area_key: str, area_dir: Path, attempt_index: int) -> dict | None:
@@ -1444,14 +2521,66 @@ class InspectionRunner(Node):
         capture['description'] = 'Camera evidence captured immediately after a failed Nav2 attempt.'
         return capture
 
-    def capture_named_image(self, area_dir: Path, stem: str) -> dict:
+    def _grab_image_on_demand(self) -> None:
+        """Momentary subscription (WiFi-constrained real robot): pull a short
+        burst at the stop, take its temporal median, then unsubscribe. Uses the
+        COMPRESSED stream and decodes locally: a raw 640x480 frame
+        (~900 KB) frequently cannot cross the campus WiFi uplink at all,
+        while the ~50 KB JPEG arrives in well under a second."""
+        import cv2
+        import numpy as np
         self._latest_image = None
-        settle = float(self.get_parameter('camera_settle_sec').value)
-        end_time = time.time() + settle
-        while time.time() < end_time:
-            rclpy.spin_once(self, timeout_sec=0.05)
-            if self._latest_image is not None:
-                break
+        self._last_capture_meta = {}
+        frames: list[CompressedImage] = []
+        warmup_count = max(0, int(self.get_parameter(
+            'image_burst_warmup_frames').value))
+        burst_count = max(1, int(self.get_parameter(
+            'image_burst_count').value))
+        target_count = warmup_count + burst_count
+        sub = self.create_subscription(
+            CompressedImage, self._image_topic + '/compressed',
+            lambda m: frames.append(m), qos_profile_sensor_data)
+        deadline = time.time() + 15.0
+        while len(frames) < target_count and time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        self.destroy_subscription(sub)
+        if not frames:
+            return
+        selected = frames[-min(burst_count, len(frames)):]
+        arrays = [cv2.imdecode(
+            np.frombuffer(bytes(frame.data), np.uint8), cv2.IMREAD_COLOR)
+            for frame in selected]
+        arrays = [array for array in arrays if array is not None]
+        if not arrays or any(array.shape != arrays[0].shape for array in arrays):
+            return
+        array = np.median(np.stack(arrays), axis=0).astype(np.uint8)
+        image = Image()
+        image.header = selected[-1].header
+        image.height, image.width = array.shape[:2]
+        image.encoding = 'bgr8'
+        image.step = image.width * 3
+        image.data = array.tobytes()
+        self._latest_image = image
+        self._last_capture_meta = {
+            'capture_mode': ('temporal_median' if len(arrays) > 1
+                             else 'single_frame'),
+            'burst_frames_requested': burst_count,
+            'burst_frames_used': len(arrays),
+            'warmup_frames_requested': warmup_count,
+        }
+
+    def capture_named_image(self, area_dir: Path, stem: str) -> dict:
+        self._last_capture_meta = {}
+        if bool(self.get_parameter('image_on_demand').value):
+            self._grab_image_on_demand()
+        else:
+            self._latest_image = None
+            settle = float(self.get_parameter('camera_settle_sec').value)
+            end_time = time.time() + settle
+            while time.time() < end_time:
+                rclpy.spin_once(self, timeout_sec=0.05)
+                if self._latest_image is not None:
+                    break
 
         if self._latest_image is None:
             return {'status': 'no_image_received', 'image_path': None}
@@ -1464,11 +2593,13 @@ class InspectionRunner(Node):
                 'image_path': None,
                 'encoding': self._latest_image.encoding,
             }
-        return {
+        result = {
             'status': 'captured',
             'image_path': str(image_path),
             'encoding': self._latest_image.encoding,
         }
+        result.update(self._last_capture_meta)
+        return result
 
     def capture_image(self, area_key: str, area_dir: Path, sample_index: int, yaw: float) -> dict:
         return self.capture_named_image(area_dir, f'scan_{sample_index:02d}_yaw_{yaw:.4f}')
@@ -1527,7 +2658,8 @@ def main(args=None):
         code = 1
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
     raise SystemExit(code)
 
 

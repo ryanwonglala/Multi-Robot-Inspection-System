@@ -2,6 +2,31 @@
 github token.md
 experiments/
 .claude/
+.vscode/
+
+# Local handover notes and final-review media (not runtime dependencies)
+COMMUNICATION_MEMORY.md
+temp goal.md
+Final review/
+
+# Recorded/calibration evidence is machine- and site-specific. Keep the
+# reproducible code/configuration in git and regenerate these artifacts.
+baselines_small/
+ros_ws/data/
+ros_ws/doc/20[0-9][0-9][0-9][0-9][0-9][0-9]/
+
+# Physical-site and device-specific material must not be published from this
+# public repository. Keep only the reusable real-robot code and empty map dir.
+ros_ws/doc/COMMUNICATION_RUNBOOK.md
+ros_ws/doc/JETSON_STANDALONE_PLAN.md
+ros_ws/src/real/data/
+ros_ws/src/real/maps/*
+!ros_ws/src/real/maps/.gitkeep
+ros_ws/src/real/config/apriltag_*.json
+ros_ws/src/real/config/inspection_real*.yaml
+ros_ws/src/real/config/tb3_usb_camera*.yaml
+ros_ws/src/real/config/world_model_real*.yaml
+ros_ws/src/real/test/test_inspection_real_config.py
 
 # Internal planning docs & local artifacts — keep local, do not publish
 GIT_SOP.md

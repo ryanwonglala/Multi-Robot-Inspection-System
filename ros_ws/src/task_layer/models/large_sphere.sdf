@@ -6,12 +6,12 @@
       <pose>0 0 0.1000 0 0 0</pose>
       <collision name="collision">
         <geometry>
-          <sphere><radius>0.1000</radius></sphere>
+          <sphere><radius>0.1400</radius></sphere>
         </geometry>
       </collision>
       <visual name="visual">
         <geometry>
-          <sphere><radius>0.1000</radius></sphere>
+          <sphere><radius>0.1400</radius></sphere>
         </geometry>
         <material>
           <diffuse>0.800 0.400 0.050 1</diffuse>

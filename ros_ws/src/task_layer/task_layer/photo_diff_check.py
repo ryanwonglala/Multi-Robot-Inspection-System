@@ -153,10 +153,41 @@ def estimate_yaw_offset(baseline: np.ndarray, current: np.ndarray,
     return float(best)
 
 
+def ecc_homography_aligned(baseline: np.ndarray,
+                           current: np.ndarray) -> np.ndarray | None:
+    """Align nearby revisits with an image-derived projective transform.
+
+    The v5 arena has a close wall/floor corner: a 3--5 cm Nav2 stop error
+    creates parallax that a rotation-only camera homography cannot remove.
+    ECC uses the whole static scene and treats a small new object as an
+    outlier. Failure is non-fatal; older alignment candidates remain as
+    fallbacks.
+    """
+    gray_base = _gray(baseline)
+    gray_current = _gray(current)
+    warp = np.eye(3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                300, 1e-6)
+    try:
+        cv2.findTransformECC(
+            gray_current, gray_base, warp, cv2.MOTION_HOMOGRAPHY,
+            criteria, None, 3)
+    except cv2.error:
+        return None
+    return cv2.warpPerspective(
+        baseline, warp, (current.shape[1], current.shape[0]),
+        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_REPLICATE)
+
+
 def diff_mask(baseline: np.ndarray, current: np.ndarray,
               threshold: int = 35, tolerance_px: int = 7,
               yaw_offset: float = 0.0,
-              camera: CameraModel | None = None) -> np.ndarray:
+              camera: CameraModel | None = None,
+              roi_top_frac: float = 0.0,
+              roi_side_frac: float = 0.0,
+              roi_bottom_frac: float = 0.0,
+              morph_kernel_px: int = 5) -> np.ndarray:
     """Binary mask of pixels in `current` that cannot be explained by the
     baseline even allowing a small local wobble.
 
@@ -204,12 +235,32 @@ def diff_mask(baseline: np.ndarray, current: np.ndarray,
     mask[-margin:, :] = 0
     mask[:, :margin] = 0
     mask[:, -margin:] = 0
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    # Real-arena ROI: with low walls the top of the frame sees PAST the
+    # arena into an uncontrolled room (people, chairs), so changes there
+    # are not evidence. Suppressing them here — after alignment, which
+    # still uses the full frame's texture — also keeps the candidate-
+    # alignment vote in detect_changes() (smallest changed area wins)
+    # blind to out-of-arena motion. Anomaly targets stand on the floor,
+    # below the horizon row, so they never live in this band.
+    if roi_top_frac > 0.0:
+        mask[:int(round(mask.shape[0] * roi_top_frac)), :] = 0
+    if roi_side_frac > 0.0:
+        side = int(round(mask.shape[1] * roi_side_frac))
+        mask[:, :side] = 0
+        mask[:, mask.shape[1] - side:] = 0
+    if roi_bottom_frac > 0.0:
+        bottom = int(round(mask.shape[0] * roi_bottom_frac))
+        mask[mask.shape[0] - bottom:, :] = 0
+    morph_kernel_px = max(1, int(morph_kernel_px))
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN,
+        np.ones((morph_kernel_px, morph_kernel_px), np.uint8))
     return mask
 
 
 def changed_regions(mask: np.ndarray, min_area_px: int = 1500,
                     min_height_px: int = 15,
+                    min_width_px: int = 1,
                     max_aspect: float = 6.0) -> list[dict]:
     """Connected changed regions large enough to matter, as
     {'bbox': (x, y, w, h), 'area_px': int} sorted by area, biggest first.
@@ -230,12 +281,95 @@ def changed_regions(mask: np.ndarray, min_area_px: int = 1500,
     regions = []
     for index in range(1, count):
         x, y, w, h, area = stats[index]
-        if area < min_area_px or h < min_height_px or w / max(h, 1) > max_aspect:
+        if (area < min_area_px or h < min_height_px or w < min_width_px
+                or w / max(h, 1) > max_aspect):
             continue
         regions.append({'bbox': (int(x), int(y), int(w), int(h)),
                         'area_px': int(area)})
     regions.sort(key=lambda r: -r['area_px'])
     return regions
+
+
+def red_target_mask(image: np.ndarray,
+                    hue_low_max: int = 5,
+                    hue_high_min: int = 175,
+                    saturation_min: int = 130,
+                    high_hue_saturation_min: int | None = None,
+                    value_min: int = 60,
+                    roi_top_frac: float = 0.0,
+                    roi_side_frac: float = 0.0,
+                    roi_bottom_frac: float = 0.0,
+                    morph_kernel_px: int = 3) -> np.ndarray:
+    """Binary mask for the site's red 3 cm anomaly cube.
+
+    Red wraps around the OpenCV HSV hue axis. The high-hue branch can use a
+    separate saturation floor because the site's shaded red cube shifts
+    toward magenta while losing saturation. Keeping the low-hue branch tight
+    prevents warm cardboard from entering the mask. The ROI matches the
+    baseline detector so lab content beyond the low arena walls is never
+    considered.
+    """
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(
+        hsv, np.array([0, saturation_min, value_min], np.uint8),
+        np.array([hue_low_max, 255, 255], np.uint8))
+    high_saturation = (saturation_min if high_hue_saturation_min is None
+                       else int(high_hue_saturation_min))
+    mask |= cv2.inRange(
+        hsv, np.array([hue_high_min, high_saturation, value_min], np.uint8),
+        np.array([179, 255, 255], np.uint8))
+    height, width = mask.shape
+    if roi_top_frac > 0.0:
+        mask[:int(round(height * roi_top_frac)), :] = 0
+    if roi_side_frac > 0.0:
+        side = int(round(width * roi_side_frac))
+        mask[:, :side] = 0
+        mask[:, width - side:] = 0
+    if roi_bottom_frac > 0.0:
+        bottom = int(round(height * roi_bottom_frac))
+        mask[height - bottom:, :] = 0
+    kernel_px = max(1, int(morph_kernel_px))
+    return cv2.morphologyEx(
+        (mask > 0).astype(np.uint8), cv2.MORPH_OPEN,
+        np.ones((kernel_px, kernel_px), np.uint8))
+
+
+def detect_red_targets(current_path: str | Path,
+                       robot_pose: tuple[float, float, float],
+                       camera: CameraModel | None = None,
+                       min_area_px: int = 150,
+                       max_range: float = 3.5,
+                       min_range: float = 0.3,
+                       roi_top_frac: float = 0.0,
+                       roi_side_frac: float = 0.0,
+                       roi_bottom_frac: float = 0.0,
+                       min_height_px: int = 6,
+                       min_width_px: int = 6,
+                       hue_high_min: int = 175,
+                       high_hue_saturation_min: int | None = None) -> dict:
+    """Detect the phase-specific red graspable cube without scene parallax."""
+    camera = camera or CameraModel()
+    current = load_image(current_path)
+    mask = red_target_mask(
+        current, hue_high_min=hue_high_min,
+        high_hue_saturation_min=high_hue_saturation_min,
+        roi_top_frac=roi_top_frac,
+        roi_side_frac=roi_side_frac,
+        roi_bottom_frac=roi_bottom_frac)
+    anomalies = []
+    for region in changed_regions(
+            mask, min_area_px=min_area_px,
+            min_height_px=min_height_px,
+            min_width_px=min_width_px,
+            max_aspect=3.0):
+        point = ground_point(
+            region, camera, robot_pose, max_range=max_range,
+            min_range=min_range)
+        if point is not None:
+            point['detection_mode'] = 'red_target'
+            anomalies.append(point)
+    return {'status': 'checked', 'anomalies': anomalies,
+            'detection_mode': 'red_target'}
 
 
 def ground_point(region: dict, camera: CameraModel,
@@ -295,7 +429,14 @@ def detect_changes(baseline_path: str | Path, current_path: str | Path,
                    threshold: int = 35, tolerance_px: int = 7,
                    min_area_px: int = 1500, max_range: float = 3.5,
                    baseline_pose: tuple[float, float, float] | None = None,
-                   min_range: float = 0.3) -> dict:
+                   min_range: float = 0.3,
+                   roi_top_frac: float = 0.0,
+                   roi_side_frac: float = 0.0,
+                   roi_bottom_frac: float = 0.0,
+                   morph_kernel_px: int = 5,
+                   min_height_px: int = 15,
+                   min_width_px: int = 1,
+                   max_aspect: float = 6.0) -> dict:
     """Full pipeline: baseline photo + current photo + robot pose at capture
     -> {'status', 'anomalies': [{'x','y','range','extent','bbox',...}]}.
 
@@ -309,7 +450,12 @@ def detect_changes(baseline_path: str | Path, current_path: str | Path,
         return {'status': 'baseline_shape_mismatch', 'anomalies': []}
     pose_for_projection = robot_pose
     yaw_offset = 0.0
-    mask = diff_mask(baseline, current, threshold, tolerance_px)
+    mask = diff_mask(baseline, current, threshold, tolerance_px,
+                     roi_top_frac=roi_top_frac,
+                     roi_side_frac=roi_side_frac,
+                     roi_bottom_frac=roi_bottom_frac,
+                     morph_kernel_px=morph_kernel_px)
+    alignment_mode = 'unaligned'
     if baseline_pose is not None:
         init = math.atan2(
             math.sin(robot_pose[2] - baseline_pose[2]),
@@ -329,27 +475,48 @@ def detect_changes(baseline_path: str | Path, current_path: str | Path,
             if abs(candidate) < 1e-4:
                 continue
             trial = diff_mask(baseline, current, threshold, tolerance_px,
-                              yaw_offset=candidate, camera=camera)
+                              yaw_offset=candidate, camera=camera,
+                              roi_top_frac=roi_top_frac,
+                              roi_side_frac=roi_side_frac,
+                              roi_bottom_frac=roi_bottom_frac,
+                              morph_kernel_px=morph_kernel_px)
             count = int(trial.sum())
             if count < best_count:
                 best_count, mask, yaw_offset = count, trial, candidate
+                alignment_mode = 'rotation_homography'
+        ecc_baseline = ecc_homography_aligned(baseline, current)
+        if ecc_baseline is not None:
+            trial = diff_mask(
+                ecc_baseline, current, threshold, tolerance_px,
+                roi_top_frac=roi_top_frac,
+                roi_side_frac=roi_side_frac,
+                roi_bottom_frac=roi_bottom_frac,
+                morph_kernel_px=morph_kernel_px)
+            count = int(trial.sum())
+            if count < best_count:
+                best_count, mask, yaw_offset = count, trial, visual
+                alignment_mode = 'ecc_homography'
         # The freshly-spun AMCL yaw lags physical heading; the baseline yaw
         # (a settled recording) plus the chosen offset is the better
         # estimate of where the camera actually pointed.
         pose_for_projection = (robot_pose[0], robot_pose[1],
                                baseline_pose[2] + yaw_offset)
     anomalies = []
-    for region in changed_regions(mask, min_area_px):
+    for region in changed_regions(
+            mask, min_area_px, min_height_px=min_height_px,
+            min_width_px=min_width_px, max_aspect=max_aspect):
         point = ground_point(region, camera, pose_for_projection, max_range,
                              min_range=min_range)
         if point is not None:
             anomalies.append(point)
     return {'status': 'checked', 'anomalies': anomalies,
-            'yaw_offset': round(yaw_offset, 4)}
+            'yaw_offset': round(yaw_offset, 4),
+            'alignment_mode': alignment_mode}
 
 
 def merge_photo_detections(existing: list[dict], new: list[dict],
-                           link_dist: float = 1.4) -> list[dict]:
+                           link_dist: float = 1.4,
+                           cross_zone_link_dist: float = 0.3) -> list[dict]:
     """Cross-yaw / cross-stop dedup: the same object seen from two photos
     yields two nearby estimates; keep the closer-range one (less projection
     error). The link distance covers the long-range projection scatter of
@@ -360,8 +527,35 @@ def merge_photo_detections(existing: list[dict], new: list[dict],
     merged = list(existing)
     for candidate in new:
         for index, kept in enumerate(merged):
-            if math.hypot(candidate['x'] - kept['x'],
-                          candidate['y'] - kept['y']) < link_dist:
+            candidate_zone = candidate.get('observed_zone')
+            kept_zone = kept.get('observed_zone')
+            distance = math.hypot(candidate['x'] - kept['x'],
+                                  candidate['y'] - kept['y'])
+            # Pure-sector observations are authoritative: never merge them
+            # across zones (two real cubes in adjacent VP regions can project
+            # close together). A single cube near an authored near/far split,
+            # however, can be seen by TWO mixed sectors and land on opposite
+            # sides because ground projection has centimetre-scale error. Merge
+            # only that tightly constrained cross-zone case.
+            if (candidate_zone is not None and kept_zone is not None
+                    and candidate_zone != kept_zone):
+                both_mixed = (bool(candidate.get('sector_mixed'))
+                              and bool(kept.get('sector_mixed')))
+                if not both_mixed or distance >= cross_zone_link_dist:
+                    continue
+                # Prefer the observation farther from its range split; it has
+                # the more reliable semantic zone. Range remains the tie-break.
+                candidate_margin = candidate.get('zone_boundary_margin_m')
+                kept_margin = kept.get('zone_boundary_margin_m')
+                replace = False
+                if candidate_margin is not None and kept_margin is not None:
+                    replace = float(candidate_margin) > float(kept_margin)
+                elif candidate.get('range', 9e9) < kept.get('range', 9e9):
+                    replace = True
+                if replace:
+                    merged[index] = candidate
+                break
+            if distance < link_dist:
                 if candidate.get('range', 9e9) < kept.get('range', 9e9):
                     merged[index] = candidate
                 break

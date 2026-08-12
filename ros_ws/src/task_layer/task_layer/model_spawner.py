@@ -127,19 +127,44 @@ def area_center(area: dict) -> tuple[float, float]:
     return float(center[0]), float(center[1])
 
 
-def area_random(area: dict, margin: float = 0.2) -> tuple[float, float]:
-    bounds = area.get('bounds') or {}
-    required = ['x_min', 'x_max', 'y_min', 'y_max']
-    if not all(key in bounds for key in required):
-        raise ValueError('area is missing bounds')
+# --- live-demo tweak (feat/live-demo-tweaks) --------------------------------
+# "Randomize" used to scatter the obstacle anywhere in the area bounds, which
+# lands on the edges where the photo-diff detector clips (bounds margin) or
+# over-ranges -> easy misses. For the live demo we make it a CONTROLLED random:
+# jitter around the area's sampling point (a viewpoint where the robot actually
+# stands & scans, else the center) within a small radius, kept clear of the
+# walls. Revert by deleting this branch.
+DEMO_RANDOM_RADIUS = 1.0  # metres of jitter around the sampling point
 
-    x_min = float(bounds['x_min']) + margin
-    x_max = float(bounds['x_max']) - margin
-    y_min = float(bounds['y_min']) + margin
-    y_max = float(bounds['y_max']) - margin
-    if x_min > x_max or y_min > y_max:
-        return area_center(area)
-    return random.uniform(x_min, x_max), random.uniform(y_min, y_max)
+
+def area_random(area: dict, margin: float = 0.2) -> tuple[float, float]:
+    # Sampling point = where the patrol parks and does its 360 deg scan.
+    viewpoints = area.get('viewpoints')
+    if viewpoints:
+        vp = random.choice(viewpoints)
+        sx, sy = float(vp['x']), float(vp['y'])
+    else:
+        sx, sy = area_center(area)
+
+    x = sx + random.uniform(-DEMO_RANDOM_RADIUS, DEMO_RANDOM_RADIUS)
+    y = sy + random.uniform(-DEMO_RANDOM_RADIUS, DEMO_RANDOM_RADIUS)
+
+    # Stay off the walls: detections within `margin` of a bound get clipped.
+    bounds = area.get('bounds') or {}
+    if all(key in bounds for key in ('x_min', 'x_max', 'y_min', 'y_max')):
+        x_min = float(bounds['x_min']) + margin
+        x_max = float(bounds['x_max']) - margin
+        y_min = float(bounds['y_min']) + margin
+        y_max = float(bounds['y_max']) - margin
+        if x_min <= x_max:
+            x = min(max(x, x_min), x_max)
+        else:
+            x = sx
+        if y_min <= y_max:
+            y = min(max(y, y_min), y_max)
+        else:
+            y = sy
+    return x, y
 
 
 def make_spawn_command(params: dict) -> list[str]:

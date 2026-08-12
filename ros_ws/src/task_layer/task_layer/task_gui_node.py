@@ -49,9 +49,10 @@ INSPECT_DISABLED_AREAS = {'mother_base', 'charging_station', 'server_door'}
 
 # Areas that are not valid scene-placement targets and must render greyed/
 # unselectable in the Scene tab — same treatment as the walled-off Lab/Prep
-# rooms (which are accessible==False in world_model.yaml). These three are
-# infrastructure markers, not placement zones (GUI-only; world_model unchanged).
-SCENE_DISABLED_AREAS = {'mother_base', 'charging_station', 'restricted_gate'}
+# rooms (which are accessible==False in world_model.yaml). These are
+# infrastructure / doorway markers, not placement zones (GUI-only; world_model
+# unchanged).
+SCENE_DISABLED_AREAS = {'mother_base', 'charging_station', 'restricted_gate', 'server_door'}
 
 # Task 1.2: The only models that can be selected in the Scene tab.
 # Spawnable shapes for robustness validation. Boxes keep all three sizes
@@ -751,12 +752,50 @@ class TaskGui:
             if area.get('accessible', True) and key not in INSPECT_DISABLED_AREAS:
                 self.inspect_area_list.selection_set(row)
 
+    def _preflight_check_robots(self, namespaces: list[str]) -> list[str]:
+        """Live-demo safety gate (does NOT touch the inspection logic itself).
+
+        Before publishing a mission, confirm each robot can actually accept a
+        nav goal by probing its nav2 NavigateToPose action server. This catches
+        the intermittent failure where a robot (commonly ARM) is allocated and
+        shown in the GUI but its nav2 stack never came up, so the runner waits
+        for a server that never appears and the whole task fails mid-run.
+
+        Returns the labels of the namespaces that are NOT ready (empty = all OK).
+        """
+        # Healthy server answers well under 1 s; 3 s tolerates a cold-but-alive
+        # stack without making a down robot freeze the GUI for long.
+        timeout = 3.0
+        not_ready = []
+        for ns in namespaces:
+            client = self.node.nav_clients.get(ns)
+            if client is None or not client.wait_for_server(timeout_sec=timeout):
+                not_ready.append(ns or '(root)')
+        return not_ready
+
     def start_inspection(self):
         route = self.get_route().strip()
         if not route:
             messagebox.showerror('Inspection Error', 'Route is empty')
             return
-        if self.inspect_mode_var.get() == 'auto':
+        # Pre-flight: verify the robots that will run can accept nav goals, so a
+        # robot whose stack didn't come up is reported HERE instead of silently
+        # failing the mission. Auto splits across all robots; manual uses one.
+        auto = self.inspect_mode_var.get() == 'auto'
+        targets = list(self.node.robot_namespaces) if auto else [self.node.active_robot]
+        not_ready = self._preflight_check_robots(targets)
+        if not_ready:
+            proceed = messagebox.askyesno(
+                'Robot Not Ready',
+                '以下机器人未就绪（nav2 导航动作服务无响应，可能 nav2 栈未完全'
+                '启动或未定位）：\n\n    %s\n\n'
+                '现在发布，该机器人很可能全程不响应、导致任务失败。\n\n'
+                '仍要继续发布吗？' % ', '.join(not_ready))
+            if not proceed:
+                self._update_inspect_status(
+                    status='已取消发布：%s 未就绪' % ', '.join(not_ready), report='')
+                return
+        if auto:
             self.start_auto_inspection(route)
         else:
             self.start_manual_inspection(route)
