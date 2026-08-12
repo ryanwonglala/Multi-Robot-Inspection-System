@@ -1,94 +1,157 @@
-# SO-ARM101 Vision Sorting Subsystem | SO-ARM101 视觉分拣子系统
+# SO-ARM101 Vision Sorting Subsystem
 
-**English** | [中文](#中文)
+Standalone vision-guided sorting module for the RoboInspect project. A fixed
+SO-ARM101 with a wrist camera detects an abnormal-colour object in a known work
+plane, approaches it, verifies the grasp, and drops it into a recycling area.
 
-Robotic-arm sorting module of the Multi-Robot Inspection System: a fixed
-SO-ARM101 detects abnormal-colored objects on a TurtleBot3 tray, grasps them,
-and drops them into a recycling bin. **Fully independent from `ros_ws/`
-(TB3)**: pure Python + lerobot, no ROS, runs on macOS.
+> **Status:** the standalone sorting pipeline was validated end to end. The
+> TurtleBot3-to-arm handoff remains an operator-supervised integration. This
+> module does not depend on ROS 2.
 
-## Approach
-- Monocular wrist-mounted webcam + planar constraint (objects on a
-  known-height plane) — no depth camera
-- Observation-pose detection: reference-frame differencing / not-white
-  segmentation (tray scenario) + solidity/Lab-rule classification
-- Localization: pixel→joint mapping from a **human-taught grid**
-  (6–16 points, plane fit, LOO ≈ 1.6°) refined by hover visual servoing
-  (2×2 Jacobian)
-- Grasping: vertical-posture constraint (shoulder + elbow + wrist pitch =
-  const) + contact-stop gripper + load verification
-- Key design decisions and negative results (YOLO-World zero detection,
-  three failed self-learned-depth schemes) are documented in
-  `docs/worklog-2026-07-30.md`
+## Design
 
-## Layout
-- `src/soarm/` — reusable modules: arm (motion/gripping), vision
-  (detection/classification), mapping (taught-grid fit), camera_client
-- `scripts/` — numbered step scripts: 01–05 basics, 09 grasp executor
-  (`--loop/--test/--step`), 10 servo calibration, 13 e-stop recovery,
-  14 reference capture, 15 per-class teaching, 16 grip-width measurement,
-  17 log analysis, 18 grid teaching, 19 manual cockpit
-- `config/` — serial port / poses / work-zone ROI / class params / servo calib
-- `calibration/` — taught sample libraries (v3 = current), stress-test log
-  (`attempts_log.jsonl`), reference frame
-- `docs/` — full worklog + new-site deployment guide
-  (`deployment-new-site.md`)
+- Monocular wrist camera and a known-height work plane; no depth camera is
+  required for grasp localization.
+- Reference-frame differencing or non-white segmentation for tray objects,
+  followed by solidity and Lab-colour classification.
+- Pixel-to-joint mapping fitted from a human-taught grid and refined by hover
+  visual servoing.
+- Vertical grasp constraint, contact-stop closing, load verification, and
+  guarded transport/drop choreography.
+- Classical vision by design; failed learned-depth and zero-shot experiments
+  are retained in `docs/worklog-2026-07-30.md` as project evidence.
 
-## Environment
-- Main venv `.venv` (Python 3.12): `lerobot[feetech]==0.6.0`,
-  `opencv-python`, `scipy`, `matplotlib`
-- Camera-only venv `.venv-cam` (python.org-signed Python 3.13 + opencv):
-  required by macOS TCC — the camera server must use it and be launched
-  from Terminal (see "camera architecture" in `CLAUDE.md`)
+## Contents
 
-## Quick start
+- `src/soarm/` — arm, vision, mapping, and camera-client modules.
+- `scripts/` — numbered commissioning, calibration, grasping, recovery, and
+  analysis tools.
+- `config/` — poses, ROI, class rules, offsets, and visual-servo parameters.
+- `calibration/` — taught grids, reference images, and stress-test records.
+- `calibration/lerobot/` — device-specific LeRobot servo calibration.
+- `docs/deployment-new-site.md` — relocation and recalibration procedure.
+- `docs/worklog-2026-07-30.md` — design decisions and experiment history.
+- `auto_clear.py` — non-interactive entry point used by the Jetson gate.
+
+## Supported environment
+
+The validated development environment used macOS with:
+
+- Python 3.12 for the arm process;
+- `lerobot[feetech]==0.6.0`;
+- OpenCV, SciPy, and Matplotlib; and
+- a separate camera-only Python environment when macOS camera permissions
+  required the camera server to own the device.
+
+Jetson/Linux deployment uses the same Python modules but must be recalibrated
+for its serial device, camera, work surface, and lighting.
+
+## Create the environments
+
+From the repository root:
+
 ```bash
-# Terminal 1: camera server (owns the camera, serves frames over HTTP)
+cd so-arm101
+
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install "lerobot[feetech]==0.6.0" \
+  opencv-python scipy matplotlib
+export PYTHONPATH="$PWD/src"
+```
+
+On macOS, create the camera environment with a Python installation that has
+camera permission:
+
+```bash
+python3.13 -m venv .venv-cam
+.venv-cam/bin/python -m pip install opencv-python
+```
+
+On Linux, add the operator to the serial-device group when required and set
+the actual port explicitly:
+
+```bash
+export SOARM_PORT=/dev/ttyACM0
+```
+
+## Hardware calibration
+
+The tracked `calibration/lerobot/main_arm.json` belongs to the original arm.
+Install it only for that same physical unit:
+
+```bash
+mkdir -p ~/.cache/huggingface/lerobot/calibration/robots/so_follower
+cp -i calibration/lerobot/main_arm.json \
+  ~/.cache/huggingface/lerobot/calibration/robots/so_follower/main_arm.json
+```
+
+Never copy this file to a different arm. Recalibrate replacement hardware
+instead. See `calibration/lerobot/README.md` for details.
+
+## Preflight
+
+Keep the arm unpowered while checking configuration and camera access. Then
+run the numbered tools in order, with the work area clear:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/01_test_arm.py
 .venv-cam/bin/python scripts/camera_server.py --index 0
-# Terminal 2: sorting loop (auto grasp+drop per round; Enter for next round)
+PYTHONPATH=src .venv/bin/python scripts/05_verify_observe.py
+```
+
+Interactive teaching tools such as `04_record_pose.py`, `10_servo_calib.py`,
+`15_teach_class.py`, `16_measure_grip.py`, `18_teach_grid.py`, and
+`19_manual_grasp.py` require an operator at the hardware.
+
+## Run the sorting workflow
+
+Use two terminals from `so-arm101/`.
+
+Terminal 1 — camera server:
+
+```bash
+.venv-cam/bin/python scripts/camera_server.py --index 0
+```
+
+Terminal 2 — supervised sorting loop:
+
+```bash
+export PYTHONPATH="$PWD/src"
+export SOARM_PORT=/dev/ttyACM0
 .venv/bin/python scripts/09_grasp.py --loop --step
 ```
 
-Conventions and safety notes (power-on lunge, unit pitfalls, pose-recording
-caveats) are centralized in `CLAUDE.md`.
+The Jetson handoff gate invokes the non-interactive entry point only after its
+ROI dwell condition succeeds:
 
----
-
-## 中文
-
-多机器人巡检系统的机械臂分拣模块：固定安装的 SO-ARM101 从 TurtleBot3 托盘上
-识别并抓取异常颜色物体，投放至回收区。**与 `ros_ws/`（TB3）完全独立**：
-纯 Python + lerobot，不依赖 ROS，运行平台 macOS。
-
-### 技术路线
-- 单目腕装 WebCam + 平面约束（物体在已知高度平面上），不用深度相机
-- 观察位检测：参考帧差分 / 非白分割（托盘场景）+ 实心度/Lab 规则分类
-- 定位：像素→关节映射（**人工示教网格** 6-16 点，平面拟合，LOO≈1.6°）
-  + 悬停视觉伺服（2×2 雅可比）精修
-- 抓取：垂直姿态约束（肩+肘+腕俯仰=常数）+ 接触即停合爪 + 负载验证
-- 关键设计决策与失败实验（YOLO-World 零检出、三种自学深度方案的失败）
-  见 `docs/worklog-2026-07-30.md`
-
-### 目录
-- `src/soarm/` 可复用模块：arm(运动/夹持) vision(检测/分类) mapping(示教映射) camera_client
-- `scripts/` 按序号排列的步骤脚本：01-05 基础，09 抓取执行器(--loop/--test/--step)，
-  10 伺服标定，13 急停恢复，14 参考照，15 类示教，16 夹宽实测，17 日志分析，
-  18 示教网格，19 手动驾驶舱
-- `config/` 串口/位姿/工作区 ROI/目标类参数/伺服标定
-- `calibration/` 示教样本库(v3=当前)、压测日志(attempts_log.jsonl)、参考帧
-- `docs/` 完整工作日志 + 新场地部署手册(deployment-new-site.md)
-
-### 环境
-- 主环境 `.venv`（Python 3.12）：`lerobot[feetech]==0.6.0` `opencv-python` `scipy` `matplotlib`
-- 相机专用 `.venv-cam`（python.org 签名版 Python 3.13 + opencv）：macOS TCC 限制，
-  相机服务必须用它并从终端启动（详见 CLAUDE.md"相机取流架构"）
-
-### 快速开始
 ```bash
-# 终端1: 相机服务(独占相机, 提供 HTTP 帧)
-.venv-cam/bin/python scripts/camera_server.py --index 0
-# 终端2: 分拣循环(每轮自动抓取+投放, Enter 进入下一轮)
-.venv/bin/python scripts/09_grasp.py --loop --step
+PYTHONPATH=src SOARM_PORT=/dev/ttyACM0 \
+  .venv/bin/python auto_clear.py
 ```
 
-约定与安全事项（上电冲击、单位陷阱、位姿录制注意）统一见 `CLAUDE.md`。
+## Relocation rules
+
+Moving the arm, camera, tray, lighting, or drop container invalidates some or
+all site calibration. Follow `docs/deployment-new-site.md`; at minimum, verify
+poses, redraw the ROI, capture a clean reference, reteach the grid, and
+recalibrate the visual-servo Jacobian before a grasp attempt.
+
+The committed calibration images and JSON files document the validated setup.
+They are examples and historical evidence, not universal deployment values.
+
+## Safety
+
+- Keep an emergency-stop or power-disconnect action within immediate reach.
+- Clear the workspace before enabling torque or running any motion script.
+- Start with low-speed, step-by-step commands after every configuration change.
+- Do not mix raw servo units with normalized gripper units.
+- Inspect `config/poses.json` after recording poses; teaching scripts can
+  replace stored values.
+- Do not run two processes against the same serial port or camera.
+- Treat perception success as insufficient proof of physical clearance.
+
+For the full design rationale and known failure modes, read
+`docs/worklog-2026-07-30.md` and `docs/deployment-new-site.md` before changing
+the control or calibration strategy.
